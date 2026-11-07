@@ -272,8 +272,11 @@ class ControlledBuffer:
         self._revision += 1
         return BufferSlice(self, region.offset, region.size, region.role)
 
-    def __getitem__(self, offset: int) -> BufferSlice:
-        return self.qword(offset)
+    def __getitem__(self, _offset: int) -> BufferSlice:
+        raise PlanningError(
+            "buffer indexing was removed; migrate message[offset] to "
+            "message.qword(offset)"
+        )
 
     def written_by(self, operation: Callable[..., Action]) -> "ControlledBuffer":
         if not callable(operation):
@@ -284,12 +287,6 @@ class ControlledBuffer:
         binder = getattr(operation, "bind_buffer", None)
         self.writer = binder(self.size) if callable(binder) else operation
         return self
-
-    def dispatch(self, offset: int | None = None) -> BufferSlice:
-        """Reserve an indirect-call qword, defaulting to the buffer's final slot."""
-
-        selected = ((self.size - 8) & -8) if offset is None else int(offset)
-        return self.qword(selected)
 
     def store(
         self,
@@ -344,36 +341,36 @@ class IndirectCallControl:
     def pivot(
         self,
         *,
-        stack: ControlledBuffer | None = None,
         gadget: int,
-        pointer_register: str | None = None,
-        **register_state: Any,
+        register: str | None = None,
+        stack: ControlledBuffer | None = None,
+        **removed: Any,
     ) -> "PivotControl":
-        if pointer_register is not None and register_state:
-            raise TypeError("pass pointer_register= or one register keyword, not both")
-        if pointer_register is None:
-            if len(register_state) != 1:
-                raise TypeError(
-                    "pivot requires pointer_register= or exactly one register=buffer keyword"
-                )
-            pointer_register, declared_pointer = next(iter(register_state.items()))
-            if stack is None and isinstance(declared_pointer, ControlledBuffer):
-                stack = declared_pointer
-            if stack is None:
-                raise TypeError(
-                    "register-keyword pivot requires a ControlledBuffer value or stack="
-                )
-            pointer_value = (
-                declared_pointer.address
-                if isinstance(declared_pointer, ControlledBuffer)
-                else declared_pointer
+        if removed:
+            spellings = ", ".join(sorted(removed))
+            raise PlanningError(
+                f"pivot aliases were removed ({spellings}); migrate to "
+                "pivot(register='eax', stack=buffer, gadget=...) or use "
+                "pwnx.advanced.pivot(...)"
             )
-            if pointer_value != stack.address:
-                raise PlanningError(
-                    f"pivot register {pointer_register} does not point at buffer {stack.name}"
-                )
-        if stack is None:
-            raise TypeError("explicit pivot requires stack=<ControlledBuffer>")
+        if register is None or stack is None:
+            raise PlanningError(
+                "pivot requires register= and stack=; legacy pointer_register= and "
+                "dynamic register keywords were removed"
+            )
+        return self._pivot(
+            stack=stack,
+            pointer_register=register,
+            gadget=gadget,
+        )
+
+    def _pivot(
+        self,
+        *,
+        stack: ControlledBuffer,
+        pointer_register: str,
+        gadget: int,
+    ) -> "PivotControl":
         if stack.challenge is not self.challenge or self.target.buffer is not stack:
             raise PlanningError("stack pivot buffer belongs to another control/challenge")
         register = _register(pointer_register, self.architecture_spec)
@@ -479,70 +476,108 @@ class RopPalette:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class RopBuilder:
+    """Immutable, autocomplete-friendly semantic ROP declaration builder."""
+
+    namespace: "RopNamespace" = field(repr=False, compare=False)
+    constraints: tuple[ByteConstraint, ...] = ()
+    _pop: Mapping[str, int] = field(default_factory=dict, repr=False)
+    _zero: Mapping[str, int] = field(default_factory=dict, repr=False)
+    _move: Mapping[tuple[str, str], int] = field(default_factory=dict, repr=False)
+    _syscall: int | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "constraints", _constraints(self.constraints))
+        object.__setattr__(self, "_pop", MappingProxyType(dict(self._pop)))
+        object.__setattr__(self, "_zero", MappingProxyType(dict(self._zero)))
+        object.__setattr__(self, "_move", MappingProxyType(dict(self._move)))
+
+    @staticmethod
+    def _insert(mapping: Mapping[Any, int], key: Any, address: int, role: str) -> dict[Any, int]:
+        result = dict(mapping)
+        if key in result:
+            if result[key] == int(address):
+                raise PlanningError(f"duplicate {role} gadget declaration for {key!r}")
+            raise PlanningError(
+                f"conflicting {role} gadget declarations for {key!r}: "
+                f"{result[key]:#x} versus {int(address):#x}"
+            )
+        result[key] = int(address)
+        return result
+
+    def pop(self, register: str, address: int) -> "RopBuilder":
+        key = _register(register, self.namespace.architecture)
+        _qword(int(address), self.constraints, role=f"pop {key} gadget")
+        return replace(self, _pop=self._insert(self._pop, key, address, "pop"))
+
+    def zero(self, register: str, address: int) -> "RopBuilder":
+        key = _register(register, self.namespace.architecture)
+        _qword(int(address), self.constraints, role=f"zero {key} gadget")
+        return replace(self, _zero=self._insert(self._zero, key, address, "zero"))
+
+    def move(self, target: str, source: str, address: int) -> "RopBuilder":
+        key = (
+            _register(target, self.namespace.architecture),
+            _register(source, self.namespace.architecture),
+        )
+        _qword(int(address), self.constraints, role=f"move {key[0]},{key[1]} gadget")
+        return replace(self, _move=self._insert(self._move, key, address, "move"))
+
+    def syscall(self, address: int) -> RopPalette:
+        if self._syscall is not None:
+            if self._syscall == int(address):
+                raise PlanningError("duplicate syscall gadget declaration")
+            raise PlanningError(
+                f"conflicting syscall gadgets: {self._syscall:#x} versus {int(address):#x}"
+            )
+        _qword(int(address), self.constraints, role="syscall gadget")
+        return replace(self, _syscall=int(address)).build()
+
+    def build(self) -> RopPalette:
+        return self.namespace._build_palette(
+            pop=self._pop,
+            zero=self._zero,
+            move=self._move,
+            syscall=self._syscall,
+            constraints=self.constraints,
+        )
+
+    def describe(self) -> str:
+        return f"constrained ROP builder for {self.namespace.architecture.name}"
+
+
 class RopNamespace:
     def __init__(self, challenge: Any):
         self.challenge = challenge
         self.architecture = resolve_architecture(challenge.exe.architecture)
 
+    def __getattr__(self, name: str) -> Any:
+        if name == "palette":
+            raise AttributeError(
+                "x.rop.palette(...) moved to "
+                "pwnx.advanced.rop_palette(challenge, ...)"
+            )
+        raise AttributeError(name)
+
     def __call__(
         self,
-        *,
         constraint: ByteConstraint | None = None,
-        constraints: Iterable[ByteConstraint] = (),
-        encoding: str | None = None,
-        **gadgets: int,
-    ) -> RopPalette:
-        declared_constraints = tuple(constraints)
+        /,
+        **removed: Any,
+    ) -> RopBuilder:
+        if removed:
+            spellings = ", ".join(sorted(removed))
+            raise PlanningError(
+                f"primary ROP keyword aliases were removed ({spellings}); migrate to "
+                "x.rop(utf8()).pop(...).zero(...).move(...).syscall(...), or use "
+                "pwnx.advanced.rop_palette(...)"
+            )
         if constraint is not None and not isinstance(constraint, ByteConstraint):
             raise TypeError("ROP constraint keyword requires a ByteConstraint")
-        if encoding is not None:
-            if constraint is not None or declared_constraints:
-                raise TypeError("pass encoding= or constraint(s)=, not both")
-            normalized_encoding = encoding.lower().replace("-", "")
-            if normalized_encoding != "utf8":
-                raise PlanningError(f"unsupported ROP encoding keyword {encoding!r}")
-            constraint = utf8()
-        pop: dict[str, int] = {}
-        zero: dict[str, int] = {}
-        move: dict[tuple[str, str], int] = {}
-        syscall: int | None = None
-        try:
-            for semantic, address in gadgets.items():
-                if semantic == "syscall":
-                    syscall = int(address)
-                    continue
-                prefix, separator, operands = semantic.partition("_")
-                if not separator or not operands:
-                    raise PlanningError(
-                        f"unknown ROP semantic keyword {semantic!r}; expected pop_REG, "
-                        "zero_REG, move_DST_SRC, or syscall"
-                    )
-                parts = operands.split("_")
-                if prefix == "pop" and len(parts) == 1:
-                    pop[parts[0]] = int(address)
-                elif prefix == "zero" and len(parts) == 1:
-                    zero[parts[0]] = int(address)
-                elif prefix == "move" and len(parts) == 2:
-                    move[(parts[0], parts[1])] = int(address)
-                else:
-                    raise PlanningError(
-                        f"malformed ROP semantic keyword {semantic!r}; expected pop_REG, "
-                        "zero_REG, move_DST_SRC, or syscall"
-                    )
-            return self.palette(
-                pop=pop,
-                zero=zero,
-                move=move,
-                syscall=syscall,
-                constraint=constraint,
-                constraints=declared_constraints,
-            )
-        except PlanningError as error:
-            if "ROP" in str(error) or "gadget" in str(error) or "semantic" in str(error):
-                raise
-            raise PlanningError(f"invalid ROP gadget keyword: {error}") from error
+        return RopBuilder(self, (constraint,) if constraint is not None else ())
 
-    def palette(
+    def _build_palette(
         self,
         *,
         pop: Mapping[str, int] | None = None,
@@ -625,8 +660,10 @@ class _ExecveIntent:
         return _prepare_execve_intent(replace(self, control=control))
 
     def with_using(self, using: Any) -> "_ExecveIntent":
+        if isinstance(using, RopBuilder):
+            using = using.build()
         if not isinstance(using, RopPalette):
-            raise PlanningError("execve using= requires x.rop.palette(...)")
+            raise PlanningError("execve using= requires an x.rop(...) builder or palette")
         if using.challenge is not self.challenge:
             raise PlanningError("execve ROP palette belongs to another challenge")
         if using.artifact_sha256 != self.challenge.exe.sha256:
@@ -941,15 +978,12 @@ def indirect_call(
     *,
     table: int,
     index: Callable[..., Action],
-    target: BufferSlice | ControlledBuffer,
-    offset: int | None = None,
+    target: BufferSlice,
     trigger: Callable[..., Action] | Action,
     state: Mapping[str, Any],
 ) -> IndirectCallControl:
-    if isinstance(target, ControlledBuffer):
-        target = target.dispatch(offset)
-    elif offset is not None:
-        raise TypeError("offset= is only valid when target is a ControlledBuffer")
+    if not isinstance(target, BufferSlice):
+        raise TypeError("indirect_call target must be buffer.qword(offset)")
     if target.buffer.challenge is not challenge:
         raise PlanningError("indirect-call target belongs to another challenge")
     delta = target.address - int(table)

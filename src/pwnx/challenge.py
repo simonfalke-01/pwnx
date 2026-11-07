@@ -910,20 +910,19 @@ class Challenge:
         *,
         at,
         size,
-        writer=None,
-        write=None,
-        constraints=(),
-        constraint=None,
         encoding=None,
+        **removed,
     ):
         from .control_flow import buffer, utf8
 
-        operation = writer if writer is not None else write
-        declared = tuple(constraints)
-        if constraint is not None:
-            if declared:
-                raise TypeError("pass constraint= or constraints=, not both")
-            declared = (constraint,)
+        if removed:
+            spellings = ", ".join(sorted(removed))
+            raise PlanningError(
+                f"primary buffer composition aliases were removed ({spellings}); "
+                "use x.buffer(at=..., size=..., encoding=...).written_by(op), "
+                "or pwnx.advanced.controlled_buffer(...)"
+            )
+        declared: tuple[Any, ...] = ()
         if encoding is not None:
             normalized = str(encoding).lower().replace("-", "")
             if normalized != "utf8":
@@ -934,7 +933,7 @@ class Challenge:
             name or "buffer",
             at=at,
             size=size,
-            writer=operation,
+            writer=None,
             constraints=declared,
         )
 

@@ -4,7 +4,7 @@
 # ruff: noqa: F401
 
 from .actions import (
-    Action, Bind, Branch, Capture, Check, Delay, Emit, Encoded, Expect, Sequence,
+    Bind, Branch, Capture, Check, Delay, Emit, Encoded, Expect, Sequence,
     capture, expect, send, sequence,
 )
 from .backends import integrations as _integrations
@@ -76,7 +76,6 @@ from .domain import (
     STRING,
     Capability,
     Constraint,
-    EffectContract,
     Environment,
     Epochs,
     Evidence,
@@ -118,13 +117,7 @@ from .concurrency import (
     SearchResult,
 )
 from .control_flow import (
-    BufferSlice,
     ByteConstraint,
-    ControlledBuffer,
-    IndirectCallControl,
-    PivotControl,
-    RopNamespace,
-    RopPalette,
     utf8,
 )
 from .fsop import (
@@ -187,7 +180,6 @@ from .libc import (
 )
 from .memory import MemoryReadEvidence, ResolveMemorySymbol
 from .patterns import observed, pattern
-from .payload import Payload
 from .planner import TechniqueContext
 from .providers import (
     GoalRequest,
@@ -230,7 +222,7 @@ from .transfers import (
     TransferResult,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "ADDRESS",
@@ -248,7 +240,6 @@ __all__ = [
     "OFFSET",
     "STRING",
     "RISCV64",
-    "Action",
     "AcquireWebArtifact",
     "AdapterSupport",
     "AllocatorModel",
@@ -265,7 +256,6 @@ __all__ = [
     "BackendCapabilities",
     "ByteTransform",
     "ByteConstraint",
-    "BufferSlice",
     "CRC16_CCITT_FALSE",
     "CRC16_XMODEM",
     "CRC32",
@@ -275,7 +265,6 @@ __all__ = [
     "Challenge",
     "Channel",
     "Constraint",
-    "ControlledBuffer",
     "ChecksumTransform",
     "CompressionTransform",
     "CredentialReference",
@@ -284,7 +273,6 @@ __all__ = [
     "DigestTransform",
     "DanglingRead",
     "DoubleFree",
-    "EffectContract",
     "Environment",
     "Epochs",
     "Evidence",
@@ -330,7 +318,6 @@ __all__ = [
     "InvestigationRejection",
     "InvestigationReport",
     "InvestigationRequest",
-    "IndirectCallControl",
     "InvocationLayout",
     "JSONCompetitionBackend",
     "KernelVMRecipe",
@@ -346,12 +333,10 @@ __all__ = [
     "MemoryAccess",
     "OpenSSHBackend",
     "Overlap",
-    "Payload",
     "PEImage",
     "PEMitigations",
     "PlatformAction",
     "PlatformResult",
-    "PivotControl",
     "Provider",
     "ProviderContext",
     "ProviderPlanner",
@@ -367,8 +352,6 @@ __all__ = [
     "RaceResult",
     "RemoteArtifact",
     "ReturnAddressControl",
-    "RopNamespace",
-    "RopPalette",
     "Scope",
     "SearchAction",
     "SearchResult",

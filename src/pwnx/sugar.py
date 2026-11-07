@@ -95,12 +95,14 @@ class QuickOperation:
         table: int,
         target: Any,
         trigger: Any,
-        state: Mapping[str, Any] | None = None,
         **register_state: Any,
     ):
-        if state is not None and register_state:
-            raise TypeError("pass state= or register keywords, not both")
-        declared_state = dict(state or register_state)
+        if "state" in register_state:
+            raise PlanningError(
+                "QuickOperation.indexes state= was removed; pass register keywords "
+                "such as eax=buffer, or use Challenge.indirect_call(...) explicitly"
+            )
+        declared_state = dict(register_state)
         normalized = {
             register: value.address if hasattr(value, "address") else value
             for register, value in declared_state.items()
