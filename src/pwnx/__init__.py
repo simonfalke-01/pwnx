@@ -37,6 +37,7 @@ from .architecture import (
 )
 from .abi import ABIField, InvocationLayout, StructSchema, TargetABI, target_abi
 from .challenge import Challenge, dynamic_call, technique
+from .bytecraft import PayloadArtifact
 from .channels import Channel, line, raw
 from .codecs import (
     CRC16_CCITT_FALSE,
@@ -48,6 +49,7 @@ from .codecs import (
     Codec,
     CompressionTransform,
     DigestTransform,
+    FramedCodec,
     TransformCodec,
     bytes_,
     cstring,
@@ -62,7 +64,8 @@ from .codecs import (
 )
 from .errors import (
     ArtifactError, ConstraintError, EndOfStream, PlanningError, ProtocolError,
-    PwnxError, ReadTimeout, ReplayDivergence, StaleValueError,
+    PwnxError, ReadTimeout, ReplayDivergence, RetryableInstanceError,
+    StaleValueError,
     UnresolvedValueError, UnsupportedFeature,
 )
 from .expressions import BindingContext, Call, Expr, Resolved
@@ -287,6 +290,7 @@ __all__ = [
     "FSOPWrite",
     "Fact",
     "FactStore",
+    "FramedCodec",
     "FileObject",
     "FlowCapture",
     "GoalRequest",
@@ -335,6 +339,7 @@ __all__ = [
     "Overlap",
     "PEImage",
     "PEMitigations",
+    "PayloadArtifact",
     "PlatformAction",
     "PlatformResult",
     "Provider",
@@ -352,6 +357,7 @@ __all__ = [
     "RaceResult",
     "RemoteArtifact",
     "ReturnAddressControl",
+    "RetryableInstanceError",
     "Scope",
     "SearchAction",
     "SearchResult",

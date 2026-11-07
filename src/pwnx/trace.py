@@ -215,6 +215,49 @@ class Trace:
 
     def diff(self, other: Trace) -> list[str]:
         differences: list[str] = []
+        left_payloads = {
+            item.get("send_id"): item
+            for item in self.metadata.get("payloads", [])
+            if item.get("send_id")
+        }
+        right_payloads = {
+            item.get("send_id"): item
+            for item in other.metadata.get("payloads", [])
+            if item.get("send_id")
+        }
+        for send_id in sorted(left_payloads.keys() & right_payloads.keys()):
+            left_item = left_payloads[send_id]
+            right_item = right_payloads[send_id]
+            if left_item.get("sha256") == right_item.get("sha256"):
+                continue
+            left_bytes = bytes.fromhex(left_item.get("bytes", ""))
+            right_bytes = bytes.fromhex(right_item.get("bytes", ""))
+            left_layout = left_item.get("layout", [])
+            right_layout = right_item.get("layout", [])
+
+            def label(layout, offset):
+                matches = [
+                    row
+                    for row in layout
+                    if int(row.get("offset", 0)) <= offset < int(row.get("end", 0))
+                ]
+                if not matches:
+                    return "unlabelled bytes"
+                matches.sort(key=lambda row: row.get("kind") == "patch")
+                return str(matches[-1].get("label", "unlabelled bytes"))
+
+            boundaries = {0, len(left_bytes), len(right_bytes)}
+            for row in (*left_layout, *right_layout):
+                boundaries.update((int(row.get("offset", 0)), int(row.get("end", 0))))
+            ordered = sorted(boundaries)
+            for start, end in zip(ordered, ordered[1:]):
+                if left_bytes[start:end] == right_bytes[start:end]:
+                    continue
+                differences.append(
+                    f"payload {left_item.get('name', 'payload')} send {send_id} "
+                    f"changed {start:#x}..{end:#x}: "
+                    f"{label(left_layout, start)} -> {label(right_layout, start)}"
+                )
         if self.metadata != other.metadata:
             differences.append("metadata differs")
         common = min(len(self.events), len(other.events))

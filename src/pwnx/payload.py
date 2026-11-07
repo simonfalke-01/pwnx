@@ -69,6 +69,7 @@ class _Segment:
     value: bytes | Any
     kind: str
     label: str
+    region_id: str
 
     @property
     def end(self) -> int:
@@ -86,6 +87,8 @@ class Payload:
         forbidden: bytes = b"",
         pointer_size: int = 8,
         byteorder: Literal["little", "big"] = "little",
+        name: str | None = None,
+        semantic_id: str | None = None,
     ) -> None:
         if not fill:
             raise ValueError("fill must not be empty")
@@ -97,7 +100,10 @@ class Payload:
         self.forbidden = bytes(forbidden)
         self.pointer_size = pointer_size
         self.byteorder = byteorder
+        self.name = name
+        self.semantic_id = semantic_id
         self._segments: list[_Segment] = []
+        self._region_counter = 0
         self._cursor = 0
         self._declared_size = 0
         if data:
@@ -121,16 +127,20 @@ class Payload:
                 result.update(_dependencies(segment.value))
         return result
 
-    def _check_range(self, offset: int, size: int) -> None:
+    def _check_range(self, offset: int, size: int, label: str = "payload region") -> None:
         if offset < 0 or size < 0:
             raise ValueError("payload offsets and sizes must be non-negative")
         end = offset + size
         for segment in self._segments:
             if offset < segment.end and segment.offset < end:
                 raise ConstraintError(
-                    f"payload range {offset:#x}..{end:#x} overlaps "
+                    f"payload region {label!r} at {offset:#x}..{end:#x} overlaps "
                     f"{segment.label!r} at {segment.offset:#x}..{segment.end:#x}"
                 )
+
+    def _next_region_id(self) -> str:
+        self._region_counter += 1
+        return f"r{self._region_counter:04d}"
 
     def place(
         self,
@@ -140,6 +150,7 @@ class Payload:
         label: str | None = None,
         word: bool = False,
         encoded: bool = False,
+        region_id: str | None = None,
     ) -> "Payload":
         if word and encoded:
             raise ValueError("a payload region cannot be both word and encoded")
@@ -162,9 +173,17 @@ class Payload:
             stored = bytes(value)
             size = len(stored)
             kind = "bytes"
-        self._check_range(offset, size)
+        selected_label = label or _describe(value)
+        self._check_range(offset, size, selected_label)
         self._segments.append(
-            _Segment(offset, size, stored, kind, label or _describe(value))
+            _Segment(
+                offset,
+                size,
+                stored,
+                kind,
+                selected_label,
+                region_id or self._next_region_id(),
+            )
         )
         self._segments.sort(key=lambda segment: segment.offset)
         self._cursor = max(self._cursor, offset + size)
@@ -179,7 +198,7 @@ class Payload:
         if isinstance(value, Payload):
             base = self._cursor
             for segment in value._segments:
-                self._check_range(base + segment.offset, segment.size)
+                self._check_range(base + segment.offset, segment.size, label or segment.label)
                 self._segments.append(
                     _Segment(
                         base + segment.offset,
@@ -187,6 +206,7 @@ class Payload:
                         segment.value,
                         segment.kind,
                         label or segment.label,
+                        self._next_region_id(),
                     )
                 )
             self._segments.sort(key=lambda segment: segment.offset)
@@ -212,7 +232,7 @@ class Payload:
         if not isinstance(other, Payload):
             raise TypeError("embed requires another Payload")
         for segment in other._segments:
-            self._check_range(offset + segment.offset, segment.size)
+            self._check_range(offset + segment.offset, segment.size, label or segment.label)
             self._segments.append(
                 _Segment(
                     offset + segment.offset,
@@ -220,6 +240,7 @@ class Payload:
                     segment.value,
                     segment.kind,
                     label or segment.label,
+                    self._next_region_id(),
                 )
             )
         self._segments.sort(key=lambda segment: segment.offset)
@@ -278,7 +299,7 @@ class Payload:
         self._cursor = max(self._cursor, size)
         return self
 
-    def build(self, context: Any | None = None) -> bytes:
+    def build_unchecked(self, context: Any | None = None) -> bytes:
         output = bytearray(
             (self.fill * ((self.size + len(self.fill) - 1) // len(self.fill)))[
                 : self.size
@@ -307,12 +328,17 @@ class Payload:
                         f"{segment.label} built {len(raw)} bytes, expected {segment.size}"
                     )
             output[segment.offset : segment.end] = raw
-        result = bytes(output)
+        return bytes(output)
+
+    def validate_bytes(self, result: bytes) -> bytes:
         violations = sorted(set(result) & set(self.forbidden))
         if violations:
             rendered = ", ".join(f"{byte:#04x}" for byte in violations)
             raise ConstraintError(f"payload contains forbidden byte(s): {rendered}")
         return result
+
+    def build(self, context: Any | None = None) -> bytes:
+        return self.validate_bytes(self.build_unchecked(context))
 
     def layout(self, context: Any | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -321,6 +347,7 @@ class Payload:
             if segment.offset > cursor:
                 rows.append(
                     {
+                        "id": f"gap:{cursor:04x}-{segment.offset:04x}",
                         "offset": cursor,
                         "size": segment.offset - cursor,
                         "end": segment.offset,
@@ -347,6 +374,7 @@ class Payload:
                         value = _describe(segment.value)
             rows.append(
                 {
+                    "id": segment.region_id,
                     "offset": segment.offset,
                     "size": segment.size,
                     "end": segment.end,
@@ -361,14 +389,92 @@ class Payload:
             cursor = segment.end
         return rows
 
+    def _resized_replace(
+        self,
+        offset: int,
+        size: int,
+        data: bytes,
+        *,
+        label: str,
+        materialized: bytes | None = None,
+    ) -> "Payload":
+        """Materialize a static resize while retaining unaffected region identities."""
+
+        original = self.build() if materialized is None else bytes(materialized)
+        old_end = offset + size
+        delta = len(data) - size
+        changed = original[:offset] + data + original[old_end:]
+        result = Payload(
+            fill=self.fill,
+            forbidden=self.forbidden,
+            pointer_size=self.pointer_size,
+            byteorder=self.byteorder,
+            name=self.name,
+            semantic_id=self.semantic_id,
+        )
+        result._region_counter = self._region_counter
+
+        for segment in self._segments:
+            if segment.end <= offset:
+                result.place(
+                    segment.offset,
+                    original[segment.offset : segment.end],
+                    label=segment.label,
+                    region_id=segment.region_id,
+                )
+                continue
+            if segment.offset >= old_end:
+                result.place(
+                    segment.offset + delta,
+                    original[segment.offset : segment.end],
+                    label=segment.label,
+                    region_id=segment.region_id,
+                )
+                continue
+
+            left_end = min(segment.end, offset)
+            if segment.offset < left_end:
+                result.place(
+                    segment.offset,
+                    original[segment.offset:left_end],
+                    label=segment.label,
+                    region_id=segment.region_id,
+                )
+            right_start = max(segment.offset, old_end)
+            if right_start < segment.end:
+                right_id = (
+                    f"{segment.region_id}:right"
+                    if segment.offset < left_end
+                    else segment.region_id
+                )
+                result.place(
+                    right_start + delta,
+                    original[right_start : segment.end],
+                    label=segment.label,
+                    region_id=right_id,
+                )
+
+        if data:
+            result.place(
+                offset,
+                data,
+                label=label,
+                region_id=result._next_region_id(),
+            )
+        result.ensure_size(len(changed))
+        return result
+
     def copy(self) -> "Payload":
         result = Payload(
             fill=self.fill,
             forbidden=self.forbidden,
             pointer_size=self.pointer_size,
             byteorder=self.byteorder,
+            name=self.name,
+            semantic_id=self.semantic_id,
         )
         result._segments = list(self._segments)
+        result._region_counter = self._region_counter
         result._cursor = self._cursor
         result._declared_size = self._declared_size
         return result

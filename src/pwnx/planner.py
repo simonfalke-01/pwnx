@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 from .actions import (
@@ -12,12 +13,15 @@ from .actions import (
     Capture,
     Delay,
     Emit,
+    Encoded,
+    PayloadFeasibility,
     Sequence,
     action_origin,
     capture,
     sequence,
 )
 from .challenge import Control, DynamicCall, Goal, Learn, Opaque, Tactic
+from .bytecraft import Craft, PatchedPayload, PlannedPayload, _Patch
 from .channels import raw
 from .domain import (
     Capability,
@@ -28,7 +32,7 @@ from .domain import (
     invalidation_semantic_key,
     requirement_satisfied,
 )
-from .errors import PlanningError, UnsupportedFeature
+from .errors import ConstraintError, PlanningError, UnsupportedFeature
 from .expressions import Call, Expr
 from .formats import (
     DeferredFormatPayload,
@@ -165,22 +169,153 @@ class Plan:
             return description
         return repr(subject)
 
+    def payloads(self) -> tuple[PlannedPayload, ...]:
+        result: list[PlannedPayload] = []
+        seen_payloads: dict[int, str] = {}
+        ordinal = 0
+
+        def walk(action: Action, stage_index: int, stage_name: str, path: tuple[int, ...]):
+            nonlocal ordinal
+            if isinstance(action, Sequence):
+                for index, child in enumerate(action.actions):
+                    walk(child, stage_index, stage_name, (*path, index))
+                return
+            if isinstance(action, Branch):
+                walk(action.then, stage_index, stage_name, (*path, 0))
+                walk(action.otherwise, stage_index, stage_name, (*path, 1))
+                return
+            if not isinstance(action, Emit):
+                return
+            value = action.data.value if isinstance(action.data, Encoded) else action.data
+            if not callable(getattr(value, "layout", None)) or not callable(
+                getattr(value, "build", None)
+            ):
+                return
+            ordinal += 1
+            payload_id = seen_payloads.get(id(value))
+            if payload_id is None:
+                payload_id = getattr(value, "semantic_id", None) or (
+                    f"generated:{stage_index + 1}:{ordinal}"
+                )
+                seen_payloads[id(value)] = payload_id
+            name = getattr(value, "name", None) or stage_name
+            send_path = ".".join(str(index + 1) for index in path) or "1"
+            result.append(
+                PlannedPayload(
+                    payload_id,
+                    str(name),
+                    stage_name,
+                    f"send:{stage_index + 1}:{send_path}",
+                    value,
+                    action,
+                )
+            )
+
+        for stage_index, stage in enumerate(self.stages):
+            for action_index, action in enumerate(stage.actions):
+                walk(action, stage_index, stage.name, (action_index,))
+        return tuple(result)
+
     def payload(self, name: str | int = -1):
-        payloads = [
-            action.data
-            for action in self.actions
-            if isinstance(action, Emit) and hasattr(action.data, "layout")
-        ]
+        payloads = self.payloads()
         if not payloads:
             raise PlanningError("plan contains no structured payloads")
         if isinstance(name, int):
-            return payloads[name]
-        for stage in self.stages:
-            if stage.name == name:
-                for action in stage.actions:
-                    if isinstance(action, Emit) and hasattr(action.data, "layout"):
-                        return action.data
+            return payloads[name].payload
+        for item in payloads:
+            if name in {item.name, item.payload_id, item.stage}:
+                return item.payload
         raise PlanningError(f"plan has no payload named {name!r}")
+
+    def payload_descriptor(self, action: Emit) -> PlannedPayload | None:
+        return next((item for item in self.payloads() if item.action is action), None)
+
+    def patch_payload(
+        self,
+        name: str | int,
+        *,
+        offset: int,
+        data: Any,
+        label: str,
+        reason: str,
+    ) -> "Plan":
+        if not reason:
+            raise TypeError("payload patch requires reason=")
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            if getattr(data, "dependencies", None):
+                raise PlanningError("payload patch cannot introduce new dependencies")
+            raise TypeError("payload patch data must be bytes-like")
+        raw = bytes(data)
+        descriptors = self.payloads()
+        selected = descriptors[name] if isinstance(name, int) else next(
+            (
+                item
+                for item in descriptors
+                if name in {item.name, item.payload_id, item.stage}
+            ),
+            None,
+        )
+        if selected is None:
+            raise PlanningError(f"plan has no payload named {name!r}")
+        payload = selected.payload
+        correlation = selected.action.correlation
+        if offset < 0 or offset + len(raw) > int(payload.size):
+            raise ConstraintError(
+                f"same length payload patch of {len(raw)} bytes at {offset:#x} "
+                f"extends beyond payload size {int(payload.size):#x}"
+            )
+        if isinstance(payload, Craft):
+            replacement: Any = payload.replace(
+                offset,
+                len(raw),
+                raw,
+                label=label,
+                reason=reason,
+            )
+        else:
+            patch = _Patch(offset, len(raw), raw, label, reason)
+            replacement = PatchedPayload(
+                payload,
+                (
+                    f"{selected.payload_id}:patch:{offset:x}:"
+                    f"{hashlib.sha256(raw).hexdigest()[:12]}"
+                ),
+                selected.name,
+                (patch,),
+            )
+
+        def rewrite(action: Action) -> Action:
+            if isinstance(action, Sequence):
+                return Sequence(tuple(rewrite(child) for child in action.actions), action.name)
+            if isinstance(action, Branch):
+                then = rewrite(action.then)
+                otherwise = rewrite(action.otherwise)
+                assert isinstance(then, Sequence) and isinstance(otherwise, Sequence)
+                return Branch(action.predicate, then, otherwise)
+            if isinstance(action, PayloadFeasibility) and (
+                action.correlation is correlation
+                if correlation is not None
+                else action.payload is payload
+            ):
+                return replace(action, payload=replacement)
+            if isinstance(action, Emit) and (
+                action is selected.action
+                or (
+                    correlation is not None
+                    and action.correlation is correlation
+                )
+            ):
+                data_value = action.data
+                if isinstance(data_value, Encoded):
+                    return replace(action, data=replace(data_value, value=replacement))
+                return replace(action, data=replacement)
+            return action
+
+        stages = [
+            replace(stage, actions=tuple(rewrite(action) for action in stage.actions))
+            for stage in self.stages
+        ]
+        return replace(self, stages=stages)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -498,17 +633,69 @@ def _control(challenge, goal: Goal | None = None) -> Control:
 
 
 def _compile_call(challenge, control: Control, call: Call, *, resume=None) -> Payload:
-    chain = ROPCompiler(challenge.images).call(
+    images = list(challenge.images)
+    target_space = getattr(call.target, "space", None)
+    if target_space is not None:
+        images.sort(
+            key=lambda image: 0 if getattr(image, "name", None) == target_space else 1
+        )
+    chain = ROPCompiler(images).call(
         call,
         resume=resume,
         entry_sp_mod16=control.entry_sp_mod16,
         forbidden=control.channel.forbidden,
     )
-    return (
-        Payload(fill=control.fill, forbidden=control.channel.forbidden)
-        .pad(control.return_at, fill=control.fill)
-        .append(chain)
+    return _overflow_payload(control, chain)
+
+
+def _overflow_payload(control: Control, tail: Payload) -> Payload:
+    payload = Payload(
+        fill=control.fill,
+        forbidden=control.channel.forbidden,
+    ).ensure_size(control.return_at)
+    for item in control.protected:
+        payload.place(
+            item.offset,
+            item.value,
+            label=item.label,
+            word=True,
+        )
+    return payload.append(tail)
+
+
+def _control_assumptions(control: Control, challenge: Any) -> tuple[str, ...]:
+    details = [
+        f"declared return address is controlled at offset {control.return_at}"
+    ]
+    details.extend(
+        f"preserve {item.label} at offset {item.offset}"
+        for item in control.protected
     )
+    if control.protected:
+        details.append(
+            f"retryable prerequisite: protected words must satisfy "
+            f"{control.channel.describe()} framing"
+        )
+        details.append(
+            f"retry budget: {getattr(challenge, '_attempt_budget', 1)} attempt(s)"
+        )
+    return tuple(details)
+
+
+def _controlled_send(payload: Payload, control: Control) -> tuple[Action, ...]:
+    actions: list[Action] = []
+    correlation = object()
+    if control.protected:
+        actions.append(
+            PayloadFeasibility(
+                payload,
+                control.channel,
+                control.protected,
+                correlation,
+            )
+        )
+    actions.append(Emit(payload, control.channel, correlation))
+    return tuple(actions)
 
 
 def _compile_learn(challenge, recipe: Learn, control: Control | None) -> tuple[Any, ...]:
@@ -522,7 +709,7 @@ def _compile_learn(challenge, recipe: Learn, control: Control | None) -> tuple[A
                 f"call-based recipe {recipe.name!r} requires return-address control"
             )
         payload = _compile_call(challenge, selected_control, using, resume=recipe.resume)
-        actions: list[Any] = [Emit(payload, selected_control.channel)]
+        actions: list[Any] = list(_controlled_send(payload, selected_control))
         if recipe.receive is not None:
             if len(recipe.targets) != 1:
                 raise PlanningError(
@@ -577,11 +764,7 @@ def _dlresolve_actions(challenge, goal: Goal, effect, control: Control, tactic=N
         entry_sp_mod16=control.entry_sp_mod16,
         forbidden=control.channel.forbidden,
     )
-    first = (
-        Payload(fill=control.fill, forbidden=control.channel.forbidden)
-        .pad(control.return_at, fill=control.fill)
-        .append(built.first_stage)
-    )
+    first = _overflow_payload(control, built.first_stage)
     options = tactic.options if isinstance(tactic, Tactic) else {}
     stage_delay = float(
         options.get(
@@ -589,7 +772,7 @@ def _dlresolve_actions(challenge, goal: Goal, effect, control: Control, tactic=N
             0.0 if control.channel.terminator is not None else 0.05,
         )
     )
-    actions: list[Any] = [Emit(first, control.channel)]
+    actions: list[Any] = list(_controlled_send(first, control))
     if stage_delay:
         actions.append(Delay(stage_delay, "separate the vulnerable read from the staging read"))
     actions.append(Emit(Payload(built.data), raw(timeout=control.channel.timeout)))
@@ -1157,7 +1340,7 @@ def build_plan(challenge) -> Plan:
                 if not isinstance(intent, Call):
                     raise PlanningError("ROP requires a statically addressed call")
                 try:
-                    return (Emit(_compile_call(challenge, control, intent), control.channel),)
+                    return _controlled_send(_compile_call(challenge, control, intent), control)
                 except UnsupportedFeature as error:
                     raise PlanningError(str(error)) from error
 
@@ -1170,6 +1353,7 @@ def build_plan(challenge) -> Plan:
                     reliability="stable",
                     assumptions=(
                         "declared return-address control reaches the selected call chain",
+                        *_control_assumptions(control, challenge),
                     ),
                 )
             )
@@ -1210,6 +1394,7 @@ def build_plan(challenge) -> Plan:
                     cost=10,
                     assumptions=(
                         "the dynamic loader metadata is reachable and writable staging is available",
+                        *_control_assumptions(control, challenge),
                     ),
                 )
             )

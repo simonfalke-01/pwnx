@@ -97,6 +97,69 @@ class Codec(ABC, Generic[T]):
             return TransformCodec(self.inner, self.transforms + tuple(transforms))
         return TransformCodec(self, tuple(transforms))
 
+    def until(
+        self,
+        delimiter: bytes | bytearray | memoryview,
+        *,
+        max_size: int = 1024 * 1024,
+    ) -> "FramedCodec[T]":
+        """Frame this codec with a delimiter for bounded stream reads."""
+
+        return FramedCodec(self, bytes(delimiter), max_size)
+
+
+@dataclass(frozen=True, slots=True)
+class FramedCodec(Codec[T], Generic[T]):
+    inner: Codec[T]
+    delimiter: bytes
+    max_size: int = 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.inner, Codec):
+            raise TypeError("framed inner value must be a Codec")
+        if not self.delimiter:
+            raise ValueError("framed delimiter cannot be empty")
+        if self.max_size <= len(self.delimiter):
+            raise ValueError("framed max_size must exceed the delimiter length")
+
+    def parse(self, data: bytes | bytearray | memoryview) -> T:
+        raw = _ensure_bytes(data, what="framed data")
+        if not raw.endswith(self.delimiter):
+            raise ProtocolError(
+                f"framed data is not terminated by {self.delimiter!r}"
+            )
+        return self.inner.parse(raw[: -len(self.delimiter)])
+
+    def build(self, value: T) -> bytes:
+        raw = self.inner.build(value)
+        if self.delimiter in raw:
+            raise ConstraintError(
+                f"framed value contains delimiter {self.delimiter!r}"
+            )
+        encoded = raw + self.delimiter
+        if len(encoded) > self.max_size:
+            raise ConstraintError(
+                f"framed value is {len(encoded)} bytes, maximum is {self.max_size}"
+            )
+        return encoded
+
+    def read(self, io: Readable, *, timeout: float | None = None) -> T:
+        raw = _read_until(
+            io,
+            self.delimiter,
+            timeout=timeout,
+            max_bytes=self.max_size,
+        )
+        return self.parse(raw)
+
+    def explain(self, value: T) -> dict[str, Any]:
+        result = self.inner.explain(value)
+        result["framing"] = {
+            "delimiter": self.delimiter.hex(),
+            "max_size": self.max_size,
+        }
+        return result
+
 
 @runtime_checkable
 class ByteTransform(Protocol):

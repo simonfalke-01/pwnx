@@ -21,6 +21,25 @@ class ConstraintError(PwnxError):
     pass
 
 
+class RetryableInstanceError(ConstraintError):
+    """A fresh target instance may satisfy an otherwise valid exploit plan."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        label: str = "",
+        offset: int | None = None,
+        byte: int | None = None,
+        channel: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.label = label
+        self.offset = offset
+        self.byte = byte
+        self.channel = channel
+
+
 class PlanningError(PwnxError):
     pass
 

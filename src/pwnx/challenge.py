@@ -6,13 +6,14 @@ import contextvars
 import hashlib
 import inspect
 import json
+import re
 import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import CodeType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping, cast
 
-from .actions import Action
+from .actions import Action, Bind, Capture, Emit, Encoded, Expect
 from .artifacts import Image
 from .channels import Channel, line
 from .domain import (
@@ -25,7 +26,12 @@ from .domain import (
     Sort,
 )
 from .domain import TargetRecipe as TargetManifest
-from .errors import ConstraintError, PlanningError, UnsupportedFeature
+from .errors import (
+    ConstraintError,
+    PlanningError,
+    RetryableInstanceError,
+    UnsupportedFeature,
+)
 from .expressions import Expr, as_expr
 from .patterns import Pattern, template
 from .providers import GoalRequest, ProviderRegistry
@@ -112,12 +118,35 @@ class Control:
     entry_sp_mod16: int = 0
     fill: bytes = b"A"
     name: str = "overflow"
+    protected: tuple["ProtectedWord", ...] = ()
 
     def __post_init__(self):
         if self.return_at < 0 or not self.fill or len(self.fill) != 1:
             raise ValueError("return_at must be nonnegative and fill must be one byte")
         if self.entry_sp_mod16 not in {0, 8}:
             raise ValueError("AMD64 entry_sp_mod16 must be 0 or 8")
+        occupied: list[tuple[int, int, str]] = []
+        for item in self.protected:
+            if item.offset % 8:
+                raise ValueError(f"protected stack word {item.label!r} must be 8-byte aligned")
+            if item.offset < 0 or item.offset + 8 > self.return_at:
+                raise ValueError(
+                    f"protected stack word {item.label!r} at {item.offset:#x} is "
+                    f"outside the overflow prefix ending at {self.return_at:#x}"
+                )
+            for start, end, label in occupied:
+                if item.offset < end and start < item.offset + 8:
+                    raise ValueError(
+                        f"protected stack word {item.label!r} overlaps {label!r}"
+                    )
+            occupied.append((item.offset, item.offset + 8, item.label))
+
+
+@dataclass(frozen=True)
+class ProtectedWord:
+    offset: int
+    value: Expr
+    label: str = "protected stack word"
 
 
 @dataclass(frozen=True)
@@ -131,6 +160,7 @@ class ControlDeclaration:
 
 @dataclass(frozen=True)
 class InputSurface:
+    challenge: Any
     channel: Channel
     name: str = "input"
 
@@ -140,13 +170,76 @@ class InputSurface:
         at: int,
         entry_sp_mod16: int = 0,
         fill: bytes = b"A",
+        canary: Any = None,
+        canary_at: int | None = None,
+        protected: Any = None,
     ) -> ControlDeclaration:
+        words: list[ProtectedWord] = []
+        if canary is not None:
+            if isinstance(canary, tuple):
+                if len(canary) != 2 or canary_at is not None:
+                    raise TypeError(
+                        "pass canary=(offset, expression) or canary=expression, "
+                        "canary_at=offset"
+                    )
+                canary_at, canary = int(canary[0]), canary[1]
+            if canary_at is None:
+                raise TypeError("canary=expression requires canary_at=offset")
+            words.append(ProtectedWord(int(canary_at), as_expr(canary), "stack canary"))
+        if protected is not None:
+            if isinstance(protected, Mapping):
+                if "offset" in protected or "value" in protected:
+                    try:
+                        words.append(
+                            ProtectedWord(
+                                int(protected["offset"]),
+                                as_expr(protected["value"]),
+                                str(protected.get("label", "protected stack word")),
+                            )
+                        )
+                    except KeyError as error:
+                        raise TypeError("protected mapping requires offset and value") from error
+                else:
+                    words.extend(
+                        ProtectedWord(int(offset), as_expr(value))
+                        for offset, value in protected.items()
+                    )
+            else:
+                for item in protected:
+                    if not isinstance(item, tuple) or len(item) not in {2, 3}:
+                        raise TypeError(
+                            "protected entries require (offset, expression[, label])"
+                        )
+                    words.append(
+                        ProtectedWord(
+                            int(item[0]),
+                            as_expr(item[1]),
+                            str(item[2]) if len(item) == 3 else "protected stack word",
+                        )
+                    )
+        for item in words:
+            if item.offset % 8:
+                raise PlanningError(
+                    f"{item.label} offset {item.offset:#x} must be 8-byte aligned"
+                )
+            if item.offset < 0 or item.offset + 8 > at:
+                raise PlanningError(
+                    f"{item.label} at offset {item.offset:#x} overlaps or exceeds "
+                    f"the return address at offset {at:#x}"
+                )
+        ordered = sorted(words, key=lambda item: item.offset)
+        for left, right in zip(ordered, ordered[1:]):
+            if left.offset + 8 > right.offset:
+                raise PlanningError(
+                    f"protected stack words {left.label!r} and {right.label!r} overlap"
+                )
         implementation = Control(
             self.channel,
             at,
             entry_sp_mod16,
             fill,
             f"{self.name} return-address control",
+            tuple(words),
         )
         capability = Capability(
             f"{self.name} controls the return address",
@@ -172,6 +265,80 @@ class InputSurface:
         )
         return ControlDeclaration(capability, implementation)
 
+    def format_leak(
+        self,
+        payload: bytes | str,
+        *,
+        after: bytes | str = b"",
+        separator: bytes | str | tuple[bytes | str, ...] | None = None,
+        description: str | None = None,
+        **named_codecs: Any,
+    ) -> "LeakNamespace":
+        from .actions import sequence
+        from .codecs import Codec, bytes_, hex_pointer
+
+        raw = payload.encode("ascii") if isinstance(payload, str) else bytes(payload)
+        if not raw or not named_codecs:
+            raise ValueError("format_leak requires a payload and at least one named capture")
+        matches = tuple(re.finditer(rb"%[0-9]+\$p", raw))
+        if len(matches) != len(named_codecs):
+            raise PlanningError(
+                f"format payload exposes {len(matches)} pointer field(s), but "
+                f"{len(named_codecs)} named capture(s) were declared"
+            )
+        if separator is None:
+            delimiters = []
+            for index, match in enumerate(matches):
+                next_start = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
+                literal = raw[match.end() : next_start]
+                delimiters.append(literal or (b"\n" if index + 1 == len(matches) else b""))
+            if any(not value for value in delimiters):
+                raise PlanningError(
+                    "cannot infer a delimiter between adjacent format fields; pass separator="
+                )
+        elif isinstance(separator, tuple):
+            delimiters = [value.encode() if isinstance(value, str) else bytes(value) for value in separator]
+            if len(delimiters) != len(matches):
+                raise PlanningError("separator tuple must contain one delimiter per capture")
+        else:
+            between = separator.encode() if isinstance(separator, str) else bytes(separator)
+            if not between:
+                raise ValueError("format leak separator cannot be empty")
+            delimiters = [between] * (len(matches) - 1) + [b"\n"]
+
+        leak_id = self.challenge.input.next_leak_id()
+        values: dict[str, Expr] = {}
+        actions: list[Action] = [Emit(Encoded(bytes_(), raw), self.channel)]
+        boundary = after.encode() if isinstance(after, str) else bytes(after)
+        if boundary:
+            actions.append(Expect(boundary))
+        for (name, codec), delimiter in zip(named_codecs.items(), delimiters, strict=True):
+            target = Expr.fact(
+                f"input.leak.{leak_id}.{name}",
+                scope="process",
+                kind="address",
+                label=name,
+            )
+            values[name] = target
+            selected: Codec[Any]
+            if codec == "hex":
+                selected = hex_pointer(delimiter=None).until(delimiter)
+            elif isinstance(codec, Codec):
+                selected = codec.until(delimiter)
+            else:
+                raise TypeError(
+                    f"format leak codec for {name!r} must be 'hex' or a Codec"
+                )
+            actions.append(Capture(selected, target, f"format leak {name}"))
+        names = ", ".join(values)
+        raw_exchange = sequence(*actions, name="raw format leak exchange")
+        declaration = sequence(
+            raw_exchange,
+            name=description or f"format leak {names}",
+        )
+        self.challenge._sequences.append(declaration)
+        return LeakNamespace(values, declaration)
+
     def format_string(self, *, offset, **options) -> ControlDeclaration:
         from .formats import format_string
 
@@ -195,14 +362,35 @@ class InputSurface:
         return ControlDeclaration(capability, implementation)
 
 
+@dataclass(frozen=True)
+class LeakNamespace:
+    values: Mapping[str, Expr]
+    action: Action
+
+    def __getattr__(self, name: str) -> Expr:
+        try:
+            return self.values[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+
+
 class InputNamespace:
+    def __init__(self, challenge: Any):
+        self.challenge = challenge
+        self._next_leak = 1
+
+    def next_leak_id(self) -> int:
+        selected = self._next_leak
+        self._next_leak += 1
+        return selected
+
     def line(self, prompt=b"", **options) -> InputSurface:
-        return InputSurface(line(prompt, **options), "line input")
+        return InputSurface(self.challenge, line(prompt, **options), "line input")
 
     def raw(self, prompt=b"", **options) -> InputSurface:
         from .channels import raw
 
-        return InputSurface(raw(prompt, **options), "raw input")
+        return InputSurface(self.challenge, raw(prompt, **options), "raw input")
 
 
 @dataclass(frozen=True)
@@ -369,7 +557,7 @@ class Challenge:
         self.rop = RopNamespace(self)
         self.stack = Facts("stack")
         self.stdout = type("Stdout", (), {"startup": "startup"})()
-        self.input = InputNamespace()
+        self.input = InputNamespace(self)
         self._controls: list[Any] = []
         self._observations: list[Observation] = []
         self._learns: list[Learn] = []
@@ -380,9 +568,11 @@ class Challenge:
         self._derivations: list[Derivation] = []
         self._opaque: list[Opaque] = []
         self._plugins: dict[str, Any] = {}
+        self._craft_names: set[str] = set()
         self._preferred: list[str] = []
         self._forbidden: set[str] = set()
         self._requirements: dict[str, Any] = {}
+        self._attempt_budget = 1
         self.capabilities: list[Capability] = []
         self.providers = ProviderRegistry()
         self.environments: dict[str, Environment] = {}
@@ -428,6 +618,48 @@ class Challenge:
         self._observations.append(obj)
         return obj
 
+    def format_leak(
+        self,
+        surface: InputSurface,
+        *,
+        prefix: bytes | str = b"",
+        separator: bytes | str = b"|",
+        **positions: int,
+    ) -> LeakNamespace:
+        if not isinstance(surface, InputSurface) or surface.challenge is not self:
+            raise PlanningError("format_leak input surface belongs to another challenge")
+        if not positions:
+            raise PlanningError("format_leak requires at least one named stack position")
+        selected = tuple(int(value) for value in positions.values())
+        if any(value <= 0 for value in selected):
+            raise PlanningError("format leak positions must be positive")
+        if len(set(selected)) != len(selected):
+            raise PlanningError("format leak positions must be unique")
+        delimiter = separator.encode() if isinstance(separator, str) else bytes(separator)
+        if not delimiter or b"%" in delimiter:
+            raise PlanningError("format leak separator must be non-empty and contain no '%'")
+        payload = delimiter.join(f"%{value}$p".encode() for value in selected)
+        boundary = prefix.encode() if isinstance(prefix, str) else bytes(prefix)
+        relationships = ", ".join(
+            f"{name} at position {position}" for name, position in positions.items()
+        )
+        prefix_description = (
+            f" after {boundary.decode('ascii', 'backslashreplace')!r}"
+            if boundary
+            else ""
+        )
+        description = (
+            f"format leak {relationships}{prefix_description}; "
+            f"separator {delimiter!r}"
+        )
+        return surface.format_leak(
+            payload,
+            after=boundary,
+            separator=delimiter,
+            description=description,
+            **{name: "hex" for name in positions},
+        )
+
     def control(self, channel=None, *, return_at=None, entry_sp_mod16=0,
                 fill=b"A", name="overflow", stack_alignment=None, **kwargs):
         from .formats import FormatControl
@@ -460,6 +692,8 @@ class Challenge:
         self, fact, *, using, receive=None, resume=None, via=None, name=None,
         cost=0, requires=(),
     ):
+        if isinstance(via, ControlDeclaration):
+            via = via.implementation
         targets = tuple(fact) if isinstance(fact, (list, tuple)) else (fact,)
         if not targets or not all(isinstance(t, Expr) for t in targets):
             raise TypeError("learn targets must be symbolic expressions")
@@ -472,6 +706,8 @@ class Challenge:
         return recipe
 
     def want(self, effect, *, using=None, via=None, terminal=None):
+        if isinstance(via, ControlDeclaration):
+            via = via.implementation
         if using is not None and isinstance(effect, GoalRequest):
             from .control_flow import attach_using
 
@@ -502,6 +738,22 @@ class Challenge:
         result = Expr.fact(f"derived.{identity}", label=label)
         self._derivations.append(Derivation(result, function, inputs))
         return result
+
+    def relate(self, target, expression, *, reason=None):
+        """Bind a symbolic relationship without a user-authored lambda."""
+
+        from .actions import sequence
+
+        selected = as_expr(target)
+        value = as_expr(expression)
+        explanation = reason or f"{selected.describe()} = {value.describe()}"
+        self._sequences.append(
+            sequence(
+                Bind(selected, value),
+                name=f"relate {explanation}",
+            )
+        )
+        return selected
 
     def fact(self, name: str, *, scope="process"):
         return Expr.fact(name, scope=scope)
@@ -580,6 +832,98 @@ class Challenge:
         obj = sequence(*actions, name=name)
         self._sequences.append(obj)
         return obj
+
+    def craft(
+        self,
+        name,
+        *,
+        endian: Literal["little", "big"] | None = None,
+        pointer_size: int | None = None,
+        fill=b"\x00",
+    ):
+        from .bytecraft import Craft
+
+        if name in self._craft_names:
+            raise ValueError(f"craft name {name!r} is already declared")
+        self._craft_names.add(name)
+        selected_endian = endian or self.target.endian
+        if selected_endian not in {"little", "big"}:
+            raise ValueError("craft endian must be 'little' or 'big'")
+        return Craft.create(
+            str(name),
+            endian=cast(Literal["little", "big"], selected_endian),
+            pointer_size=pointer_size or self.target.pointer_size,
+            fill=fill,
+        )
+
+    def send(self, craft, *, to):
+        from .actions import Branch, Encoded, PayloadFeasibility, Sequence, sequence
+
+        from .bytecraft import Craft
+
+        if not isinstance(craft, Craft):
+            raise TypeError("x.send requires a Craft")
+        if isinstance(to, InputSurface):
+            action = Emit(craft, to.channel)
+        elif isinstance(to, Channel):
+            action = Emit(craft, to)
+        elif callable(to):
+            action = to(craft)
+            if not isinstance(action, Action):
+                raise PlanningError("craft destination did not produce an Action")
+        else:
+            raise TypeError("craft destination must be an InputSurface, Channel, or operation")
+
+        guarded = False
+
+        def correlate(item):
+            nonlocal guarded
+            if isinstance(item, Emit):
+                value = item.data.value if isinstance(item.data, Encoded) else item.data
+                if value is not craft:
+                    return item
+                correlation = object()
+                correlated = replace(item, correlation=correlation)
+                if not (
+                    craft.dependencies
+                    and (
+                        item.channel.terminator is not None
+                        or item.channel.forbidden
+                        or item.channel.max_size is not None
+                    )
+                ):
+                    return correlated
+                guarded = True
+                return Sequence(
+                    (
+                        PayloadFeasibility(
+                            craft,
+                            item.channel,
+                            correlation=correlation,
+                        ),
+                        correlated,
+                    ),
+                    f"guarded send {craft.name}",
+                )
+            if isinstance(item, Sequence):
+                return Sequence(tuple(correlate(child) for child in item.actions), item.name)
+            if isinstance(item, Branch):
+                return Branch(
+                    item.predicate,
+                    correlate(item.then),
+                    correlate(item.otherwise),
+                )
+            return item
+
+        action = correlate(action)
+        if guarded:
+            self._narrative_assumptions.append(
+                f"retryable prerequisite: symbolic craft {craft.name!r} must satisfy "
+                "its destination framing within the run attempt budget"
+            )
+        declaration = sequence(action, name=f"send craft {craft.name}")
+        self.want(declaration, terminal=False)
+        return declaration
 
     def menu(self, prompt, *, name="store", **operations):
         from .sugar import quick_menu
@@ -969,17 +1313,91 @@ class Challenge:
         transport=None,
         replay=None,
         on=None,
+        attempts=1,
     ):
         if _collect.get() is not None:
             return _CollectionRun()
+        if not isinstance(attempts, int) or attempts <= 0:
+            raise ValueError("attempts must be a positive integer")
+        if attempts > 1 and replay is not None:
+            raise UnsupportedFeature("attempts>1 is incompatible with replay")
+        if attempts > 1 and transport is not None:
+            raise UnsupportedFeature(
+                "attempts>1 requires pwnx to open a fresh target; explicit transport "
+                "cannot be refreshed"
+            )
         selected_target = self._default_target_recipe if on is None else on
-        return self.plan().run(
-            profile=profile,
-            trace=trace,
-            transport=transport,
-            replay=replay,
-            on=selected_target,
-        )
+        if attempts > 1 and selected_target is not None:
+            lifecycle = getattr(selected_target, "lifecycle", None)
+            if lifecycle is not None and not (
+                str(lifecycle.process).startswith("fresh-")
+                or str(lifecycle.connection).startswith("fresh-")
+            ):
+                raise UnsupportedFeature(
+                    "attempts>1 requires a target recipe with a fresh process or connection"
+                )
+        self._attempt_budget = attempts
+        plan = self.plan()
+        if attempts == 1:
+            return plan.run(
+                profile=profile,
+                trace=trace,
+                transport=transport,
+                replay=replay,
+                on=selected_target,
+            )
+
+        from .trace import Trace
+
+        failures: list[str] = []
+        last_error: RetryableInstanceError | None = None
+        for attempt in range(1, attempts + 1):
+            attempt_trace = Trace()
+            try:
+                run = plan.run(
+                    profile=profile,
+                    trace=attempt_trace,
+                    on=selected_target,
+                )
+            except RetryableInstanceError as error:
+                failures.append(str(error))
+                last_error = error
+                if isinstance(trace, Trace):
+                    trace.metadata.clear()
+                    trace.metadata.update(attempt_trace.metadata)
+                    trace.metadata["retry"] = {
+                        "budget": attempts,
+                        "used": attempt,
+                        "failures": list(failures),
+                    }
+                    trace.events[:] = attempt_trace.events
+                continue
+            if run.trace is not None:
+                run.trace.metadata["retry"] = {
+                    "budget": attempts,
+                    "used": attempt,
+                    "failures": list(failures),
+                }
+            if trace is not None:
+                if isinstance(trace, Trace):
+                    trace.metadata.clear()
+                    trace.metadata.update(attempt_trace.metadata)
+                    trace.events[:] = attempt_trace.events
+                    run.trace = trace
+                elif isinstance(trace, (str, Path)):
+                    run.trace_path = Path(trace)
+                else:
+                    raise TypeError("trace must be a Trace or filesystem path")
+            return run
+
+        assert last_error is not None
+        raise RetryableInstanceError(
+            f"retry attempts exhausted: {attempts}/{attempts}; last failure: {last_error}",
+            label=last_error.label,
+            offset=last_error.offset,
+            byte=last_error.byte,
+            channel=last_error.channel,
+        ) from last_error
 
 
 @dataclass(frozen=True)

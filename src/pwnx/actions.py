@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping
 from .channels import Channel, raw
 from .codecs import Codec
 from .domain import EffectContract, Scope
+from .errors import ConstraintError, RetryableInstanceError
 from .expressions import Expr
 
 
@@ -137,10 +138,18 @@ class Encoded:
     def dependencies(self) -> set[str]:
         if isinstance(self.value, Expr):
             return set(self.value.dependencies)
-        return set()
+        return set(getattr(self.value, "dependencies", ()))
 
     def build(self, resolve: Callable[[Any], Any] | None = None) -> bytes:
-        value = resolve(self.value) if resolve is not None else self.value
+        if isinstance(self.value, Expr):
+            value = resolve(self.value) if resolve is not None else self.value
+        else:
+            builder = getattr(self.value, "build", None)
+            if callable(builder):
+                context = getattr(resolve, "__self__", None) if resolve is not None else None
+                value = builder(context)
+            else:
+                value = self.value
         return self.codec.build(value)
 
     def describe(self) -> str:
@@ -151,6 +160,7 @@ class Encoded:
 class Emit(Action):
     data: Any
     channel: Channel = field(default_factory=raw)
+    correlation: object | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.channel, Channel):
@@ -160,7 +170,7 @@ class Emit(Action):
         return f"send {_describe_value(self.data)} through {self.channel.describe()}"
 
     def contract(self) -> EffectContract:
-        dependencies = tuple(
+        dependencies = () if getattr(self.data, "defer_dependencies", False) else tuple(
             Expr.fact(name) for name in sorted(getattr(self.data, "dependencies", ()))
         )
         return EffectContract(
@@ -283,6 +293,138 @@ class Check(Action):
             reads=frozenset({"process.facts"}),
             scope=Scope.PROCESS,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PayloadFeasibility(Action):
+    """Validate instance-dependent protected words before an outbound effect."""
+
+    payload: Any
+    channel: Channel
+    protected: tuple[Any, ...] = ()
+    correlation: object | None = field(default=None, repr=False, compare=False)
+
+    def describe(self) -> str:
+        labels = ", ".join(
+            f"{item.label} at offset {item.offset}" for item in self.protected
+        ) or "dynamic protected words"
+        return (
+            f"retryable framing feasibility for {labels} through "
+            f"{self.channel.describe()}"
+        )
+
+    def contract(self) -> EffectContract:
+        requirements = tuple(
+            Expr.fact(name)
+            for name in sorted(getattr(self.payload, "dependencies", ()))
+        )
+        return EffectContract(
+            requires=requirements,
+            reads=frozenset({"process.facts"}),
+            scope=Scope.PROCESS,
+        )
+
+    def _retry(
+        self,
+        item: Any,
+        *,
+        offset: int,
+        byte: int,
+        reason: str,
+    ) -> None:
+        channel = self.channel.describe()
+        raise RetryableInstanceError(
+            f"retryable {item.label} framing failure at payload offset {offset} "
+            f"({offset:#x}): "
+            f"byte {byte:#04x} {reason} for {channel}",
+            label=str(item.label),
+            offset=offset,
+            byte=byte,
+            channel=channel,
+        )
+
+    def execute(self, runtime: Any) -> bytes:
+        unchecked = getattr(self.payload, "build_unchecked", None)
+        raw = (
+            unchecked(runtime.context)
+            if callable(unchecked)
+            else self.payload.build(runtime.context)
+        )
+        layout_method = getattr(self.payload, "layout", None)
+        layout = layout_method(runtime.context) if callable(layout_method) else ()
+
+        def retry_dynamic(offset: int, byte: int, reason: str) -> None:
+            covering = [
+                row
+                for row in layout
+                if int(row.get("offset", 0)) <= offset < int(row.get("end", 0))
+            ]
+            if not covering:
+                return
+            patches = [row for row in covering if row.get("kind") == "patch"]
+            row = patches[-1] if patches else covering[-1]
+            if not row.get("dependencies"):
+                return
+            proxy = type(
+                "DynamicRegion",
+                (),
+                {
+                    "label": row.get("label", "dynamic payload region"),
+                    "offset": int(row.get("offset", offset)),
+                },
+            )()
+            self._retry(proxy, offset=offset, byte=byte, reason=reason)
+
+        def retry_dynamic_range(start: int, end: int, reason: str) -> None:
+            for offset in range(start, end):
+                retry_dynamic(offset, raw[offset], reason)
+
+        validator = getattr(self.payload, "validate_bytes", None)
+        if callable(validator):
+            try:
+                validator(raw)
+            except ConstraintError:
+                forbidden = bytes(getattr(self.payload, "forbidden", b""))
+                payload_forbidden_position = next(
+                    (index for index, byte in enumerate(raw) if byte in forbidden),
+                    None,
+                )
+                if payload_forbidden_position is not None:
+                    retry_dynamic(
+                        payload_forbidden_position,
+                        raw[payload_forbidden_position],
+                        "is forbidden",
+                    )
+                raise
+        try:
+            self.channel.encode(raw)
+        except ConstraintError:
+            channel_forbidden_position = next(
+                (
+                    index
+                    for index, byte in enumerate(raw)
+                    if byte in self.channel.forbidden
+                ),
+                None,
+            )
+            if channel_forbidden_position is not None:
+                retry_dynamic(
+                    channel_forbidden_position,
+                    raw[channel_forbidden_position],
+                    "is forbidden by channel",
+                )
+            terminator = self.channel.terminator
+            if terminator:
+                start = raw.find(terminator)
+                if start >= 0:
+                    end = start + len(terminator)
+                    retry_dynamic_range(
+                        start,
+                        end,
+                        f"starts channel terminator {terminator!r}",
+                    )
+            raise
+        return raw
 
 
 @dataclass(frozen=True, slots=True)

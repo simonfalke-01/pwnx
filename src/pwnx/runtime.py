@@ -30,6 +30,7 @@ from .actions import (
     action_executor,
 )
 from .challenge import Opaque
+from .bytecraft import PayloadArtifact, artifact_from_emission
 from .domain import (
     Capability,
     Constraint,
@@ -142,6 +143,10 @@ class Run:
     trace: Trace | None = None
     trace_path: Path | None = None
     capabilities: list[Capability] = field(default_factory=list)
+    _payload_artifacts: list[PayloadArtifact] = field(
+        default_factory=list,
+        repr=False,
+    )
     _closed: bool = False
 
     def fact(self, expression: Expr):
@@ -154,7 +159,16 @@ class Run:
         return _value(payload, self.context)
 
     def payload(self, name=-1):
-        return self.plan.payload(name)
+        artifacts = self.payloads()
+        if isinstance(name, int):
+            return artifacts[name]
+        for item in artifacts:
+            if name in {item.name, item.id, item.stage}:
+                return item
+        raise PlanningError(f"run has no payload named {name!r}")
+
+    def payloads(self) -> tuple[PayloadArtifact, ...]:
+        return tuple(self._payload_artifacts)
 
     def explain(self, expression):
         return self.context.explain(expression)
@@ -530,20 +544,28 @@ class Interpreter:
                     )
             payload_bytes = _value(action.data, self.run.context)
             raw = action.channel.encode(payload_bytes)
-            layout = getattr(action.data, "layout", None)
-            if callable(layout) and self.run.trace is not None:
-                self.run.trace.metadata.setdefault("payloads", []).append(
-                    {
-                        "description": action.describe(),
-                        "size": len(payload_bytes),
-                        "sha256": hashlib.sha256(payload_bytes).hexdigest(),
-                        "layout": layout(self.run.context),
-                    }
+            descriptor = self.run.plan.payload_descriptor(action)
+            artifact = (
+                artifact_from_emission(
+                    descriptor,
+                    payload_bytes,
+                    self.run.context,
                 )
+                if descriptor is not None
+                else None
+            )
             if self._message_oriented():
                 self.run.tube.send_datagram(raw, timeout=action.channel.timeout)
             else:
                 self.run.tube.send(raw, timeout=action.channel.timeout)
+            if artifact is not None:
+                self.run._payload_artifacts.append(artifact)
+                if self.run.trace is not None:
+                    metadata = artifact.to_dict()
+                    metadata["description"] = action.describe()
+                    self.run.trace.metadata.setdefault("payloads", []).append(
+                        metadata
+                    )
             return raw
         if isinstance(action, Expect):
             if self._message_oriented():
