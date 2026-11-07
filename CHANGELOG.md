@@ -66,6 +66,30 @@
 - Moved map-based palettes, explicit controlled-buffer construction, pivot
   helpers, and implementation types to `pwnx.advanced`; removed their primary
   aliases and added migration diagnostics for 0.4 solves.
+- Added the 0.5 stack-flow frontend: ordered named `format_leak` captures with
+  prefix/separator parsing, symbolic `relate` equations, canary-protected sparse
+  return-address payloads, and automatic dependency ordering into ret2libc.
+- Added `examples/cage.py`, semantic show/raw expand and replay tests, plus an
+  opt-in real Cage Docker shell gate using `PWNX_CAGE_CHALLENGE` and
+  `PWNX_RUN_CTF_E2E=1`.
+- Added glass-box `x.craft` byte construction with immutable labelled layouts,
+  symbolic words/pointers/codecs, sparse placement, constraints, structural
+  show/layout, resolved hexdumps, and raw/menu `x.send` reuse over Payload/Emit.
+- Added Plan payload inventory/retrieval, resolved runtime `PayloadArtifact`
+  bytes/layout/hash/provenance/diff, immutable reasoned `patch_payload` variants,
+  and payload-region/send-correlated trace diffs.
+- Added fresh-instance `run(attempts=N)` for retryable line-framing failures
+  after symbolic resolution, with exact attempt budgets, lifecycle enforcement,
+  failure evidence, cleanup, and no retries for ordinary runtime errors.
+- Hardened Craft validation after both local and Plan patches, including
+  generated ret2win payloads; chained requirements now compose monotonically
+  and reject conflicting bounds at declaration.
+- Generalized framing feasibility to every symbolic Craft region, distinguished
+  dynamic retryable failures from static nonretryable constraints, and retained
+  raw-channel semantics.
+- Made runtime PayloadArtifact values immutable send-time snapshots. Later fact
+  invalidation/rebinding cannot change prior artifacts, and repeated sends of
+  one Craft retain distinct bytes, provenance, and send IDs.
 
 ## 0.3.0
 

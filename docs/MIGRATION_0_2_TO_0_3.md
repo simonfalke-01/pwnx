@@ -95,6 +95,55 @@ compiler mechanisms live under pwnx.backends. For example, use
 `pwnx.backends.rop.SigreturnFrame`, `pwnx.backends.toolchain.asm`, or
 `pwnx.backends.transports.ProcessTube`.
 
+### Migrating manual byte layouts to 0.5 bytecraft
+
+Compatibility packing remains available, but competition solves can keep exact
+layouts inside the same fact/plan/trace model:
+
+| Manual/compatibility pattern | 0.5 glass-box form |
+| --- | --- |
+| `flat`, `fit`, repeated padding, or manual concatenation | `x.craft(name).raw().pad().pad_to().align().at()` |
+| `p16`/`p32`/`p64` | `.int(value, bits=...)` or target-width `.word(value)` |
+| Partial pointer slicing | `.ptr(value, bytes=N)` |
+| Custom codec bytes | `.encoded(codec, value)` |
+| Ad-hoc bad-byte/length checks | `.require(no=..., min_size=..., max_size=..., exact_size=..., encoding=..., constraint=...)` |
+| `sendafter`/menu wrapper for constructed bytes | `x.send(craft, to=input_or_menu_operation)` |
+| Mutating one stage for remote offsets | `plan.patch_payload(name, offset=..., data=..., label=..., reason=...)` |
+| Printing unresolved placeholder bytes | `craft.show()`/`layout()` before facts; `hexdump()` only after resolution |
+
+`Plan.payloads()` inventories structured sends and `Run.payload()` returns a
+resolved `PayloadArtifact`. The latter carries bytes, layout, SHA-256,
+provenance, stage/send identity, hexdump, and region diff. Bytecraft uses the
+same underlying Payload and Emit IR; it is not a replacement tube or a renamed
+pwntools packing module.
+
+Constraints and patches are stricter than ad-hoc bytearray mutation:
+
+- Chained `require()` calls only strengthen the contract: forbidden bytes,
+  encodings, and predicates accumulate; minimum/maximum bounds converge; exact
+  sizes must remain compatible.
+- `Craft.replace()` and `Plan.patch_payload()` re-run the complete final
+  validation before send, including compiler-generated payloads such as
+  ret2win stages.
+- Runtime `PayloadArtifact` values are immutable snapshots taken at each send.
+  They survive later fact invalidation/rebinding, and sending one Craft twice
+  produces two artifacts with distinct send IDs and send-time bytes.
+
+### Migrating ad-hoc instance retry loops
+
+When a per-instance fact violates line framing, declare the constraint on the
+Craft or protected stack word and call `run(attempts=N)`. Pwnx retries only the
+labelled `RetryableInstanceError` with a fresh process/connection, closes failed
+instances, and records failures in trace metadata. It does not retry EOF,
+protocol errors, explicit transports/replay, or targets without a fresh
+lifecycle.
+
+Retry classification is dependency-aware. A line terminator or forbidden byte
+inside a dynamic symbolic Craft region is retryable because a fresh target may
+produce different facts. The same byte in static Craft data is a normal
+ConstraintError and opens only one instance. Raw channels do not apply line
+framing.
+
 ## Custom facts and techniques
 
 0.2 decorators continue to work. New extensions should register providers and

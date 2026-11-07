@@ -92,6 +92,82 @@ The canonical advanced acceptance solve is
 function, lambda, internal Action/contract/fact type, backend compiler, packing,
 or tube call. The easy ret2win path remains unchanged.
 
+### Stack-flow frontend
+
+The quick stack frontend composes existing protocol and control primitives:
+
+- `Challenge.format_leak()` builds one ordered positional-pointer exchange from
+  named stack positions, consumes an optional response prefix, parses separator-
+  delimited hex fields, and returns a namespace of process-scoped facts.
+- `Challenge.relate()` lowers an explicit symbolic equation to a normal Bind
+  action, preserving provenance and dependency ordering.
+- `InputSurface.return_address(..., canary=(offset, fact))` adds an aligned,
+  bounded protected qword to the existing overflow control declaration.
+- The existing call/ROP strategy consumes the rebound libc and control facts;
+  no stack-flow-specific runtime path or planner type switch exists.
+
+The generated format exchange, relationship, and sparse protected payload are
+ordinary Actions and contracts. Semantic `Plan.show()` omits raw exploit bytes;
+`Plan.expand(stage)` exposes the exact format payload, prompt parsing, codecs,
+protected offsets, and generated chain.
+
+`examples/cage.py` is the canonical quick CTF example and has executed locally
+against the real Cage challenge. The opt-in Docker shell test is gated by
+`PWNX_CAGE_CHALLENGE` and `PWNX_RUN_CTF_E2E=1`.
+
+### Glass-box bytecraft and fresh-instance retries
+
+`bytecraft.py` is an immutable competition-facing frontend over the existing
+Payload representation. It is deliberately below intent recipes and above
+packing/backend internals.
+
+- Craft operations create labelled raw, padding, aligned, sparse, integer,
+  pointer, partial-pointer, and codec-encoded regions.
+- Symbolic values retain fact dependencies. Structural `layout()` and `show()`
+  work unresolved; byte-level `build()` and `hexdump()` require a binding
+  context and never fabricate placeholder bytes.
+- Craft constraints reuse Payload forbidden bytes and support size, encoding,
+  predicate, and reusable byte validators.
+- `Challenge.send()` lowers a Craft through the same Emit action used by raw,
+  line, and menu recipes.
+
+Constraint composition is monotonic across immutable builder calls: forbidden
+sets accumulate, size bounds only strengthen, encodings/predicates accumulate,
+and conflicting exact bounds fail immediately. Craft replacements and Plan
+patches use unchecked reconstruction followed by the same final validation, so
+patching cannot bypass bad-byte, size, encoding, predicate, or channel rules.
+
+The Plan recursively inventories structured sends as `PlannedPayload` records
+with stable payload/send/stage identity. Runtime resolves them into the only
+primary exported implementation type, `PayloadArtifact`, containing bytes,
+layout, dependencies, SHA-256, provenance, hexdump, and region diff. Trace
+payload metadata uses the same payload and send IDs.
+
+PayloadArtifact is appended at Emit time from the bytes and facts actually sent.
+It is never recomputed from the final fact store. Fact invalidation/rebinding
+cannot alter an earlier artifact; repeated sends of one Craft create distinct
+artifacts with distinct send IDs.
+
+`Plan.patch_payload()` returns a new Plan whose selected payload has an
+explicit labelled, reasoned, same-size patch. It does not mutate the source
+Plan, add dependencies, or bypass constraints. Replay rejects a trace recorded
+for different bytes; Trace diff correlates changed ranges with layout labels
+and send identity.
+
+Line channels add generic Craft feasibility after symbolic resolution/final
+validation and before send. A dynamic labelled region containing a terminator
+or forbidden byte raises RetryableInstanceError with label, offset, byte, and
+channel evidence. Static invalid bytes remain nonretryable ConstraintError; raw
+channels do not apply line framing.
+`Challenge.run(attempts=N)` catches only that error, opens a fresh target epoch,
+closes failed instances, and records retry budget/use/failures. Explicit
+transports, replay, persistent lifecycles, and nonretryable errors do not enter
+the loop.
+
+`examples/bytecraft.py` is the canonical byte-layout example. The Cage example
+uses `attempts=64` because its leaked canary is instance-scoped and may be
+incompatible with line framing.
+
 ### Generic constrained control flow
 
 `control_flow.py` provides the same mechanics-versus-reasoning boundary for

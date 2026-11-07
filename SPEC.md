@@ -255,6 +255,72 @@ includes code, constants, defaults, keyword defaults, and stable closure
 values. Unsupported captured state requires `semantic_id=`. Replay rejects a
 changed default, closure, or explicit identity.
 
+### 4.4 Glass-box bytecraft fallback
+
+Intent recipes own common mechanics. When the byte layout itself is challenge
+knowledge, `craft()` exposes an immutable labelled layout over the same Payload
+and Emit IR:
+
+~~~python
+stage = (
+    c.craft("stage 2 overflow")
+    .pad_to(24, fill=b"A", label="buffer")
+    .word(leaks.cookie, label="stack cookie")
+    .pad(8, fill=b"B", label="saved frame")
+    .word(c.libc.base + 0x2A3E5, label="pop rdi")
+    .ptr(c.libc.base + 0x1D8698, label="/bin/sh")
+    .word(c.libc.base + 0x50D70, label="system")
+    .require(no=b"\n", max_size=0x100)
+)
+
+c.send(stage, to=c.input.line(b"payload: "))
+~~~
+
+The canonical layout vocabulary is `raw`, `pad`, `pad_to`, `align`, `at`,
+`int`, `word`, `ptr`, `encoded`, `require`, and explicit `replace`. Every region
+has a stable label and offset. The builder inherits target endian and pointer
+size unless the author overrides them.
+
+`layout()` and `show()` are valid for unresolved symbolic layouts and expose
+dependencies. `hexdump()` requires concrete bytes and raises an unresolved-value
+error rather than printing placeholders. The normal planning/runtime path
+resolves the same Craft into a PayloadArtifact with bytes, layout, SHA-256,
+provenance, stage/send identity, hexdump, and region-diff support.
+
+`send()` accepts an InputSurface, Channel, or callable menu operation and lowers
+to ordinary Emit actions. `Plan.payloads()` inventories nested and generated
+structured sends; `Plan.payload()` retrieves the planned object.
+`Plan.patch_payload()` creates an immutable same-size variant with a mandatory
+reason, cannot add symbolic dependencies, and remains subject to replay and
+trace-diff checks.
+
+Constraint composition is monotonic. Repeated `require()` calls union forbidden
+bytes, retain the greatest minimum and smallest maximum, retain every encoding
+and predicate, and reject conflicting exact/bound combinations at declaration.
+Craft replacement and Plan patch variants run the complete final validation
+before send, including patches to compiler-generated payloads.
+
+PayloadArtifact is captured from the bytes, layout, dependencies, and provenance
+visible at the actual Emit. It is not rebuilt from the final BindingContext.
+Later invalidation/rebinding cannot rewrite it, and repeated sends of one Craft
+produce separate artifacts with distinct send IDs.
+
+Bytecraft is not a parallel packing/tube API. It is the low-level view beneath
+recipes, retaining labels, facts, constraints, plan stages, trace correlation,
+and replay.
+
+Line framing is a runtime feasibility constraint when any Craft region contains
+instance-scoped symbolic facts. After resolution and final validation, but
+before send, pwnx checks terminator/forbidden bytes and reports the responsible
+labelled dynamic region, payload offset, offending byte, and channel. Static
+invalid bytes remain ordinary ConstraintError and never trigger retries; raw
+channels do not impose line framing. `run(attempts=N)` retries only the dynamic
+`RetryableInstanceError`, opening a fresh process or connection and closing the
+failed one. EOF, prompt mismatch, and other runtime failures are not retried.
+Retry metadata records the budget, attempts used, and failure messages. Multi-
+attempt execution rejects explicit transports, replay, and persistent target
+lifecycles because they cannot provide a fresh instance.
+
 ## 5. Target Vocabulary
 
 A challenge owns its architecture, artifacts, configuration, values, and
@@ -1017,7 +1083,60 @@ Ordinary actions are never made concurrent implicitly. A race is one explicit
 opaque-effect boundary whose inputs, lifecycle changes, and portable result are
 recorded for replay.
 
-### 16.4 Heap Exploitation
+### 16.4 Stack Leak and Protected Return Control
+
+The primary stack-flow helpers compress the common CTF sequence “leak named
+stack values, relate an image base, preserve a canary, then use control”:
+
+~~~python
+leaks = c.format_leak(
+    c.input.line(b"sing> "),
+    canary=9,
+    libc=11,
+    prefix=b"The canary tilts its head: ",
+    separator=b"|",
+)
+
+c.relate(c.libc.base, leaks.libc - 0x29CA8)
+
+control = c.control(
+    c.input.line(b"sing> ").return_address(
+        at=40,
+        canary=(24, leaks.canary),
+    )
+)
+
+c.want(c.shell(), via=control)
+c.run(attempts=64)
+~~~
+
+Named keyword order defines both the generated positional format payload and
+capture order. Positions must be positive and unique. `prefix` is consumed
+before the first capture; `separator` delimits the named hexadecimal pointers.
+The returned namespace exposes symbolic fields by name.
+
+`relate(target, expression)` registers a visible symbolic binding action. It is
+the primary spelling for a known leak/base equation and requires no lambda or
+custom Action.
+
+`return_address(at=..., canary=(offset, fact))` adds the canary as a protected
+qword in the overflow prefix. Protected words must be aligned, fit before the
+saved return address, and not overlap one another. Payload lowering fills gaps,
+places protected words, and appends the selected control-flow chain. The
+planner orders the format exchange and relationship before the payload that
+depends on them.
+
+`Plan.show()` renders names, positions, prefix/separator, relationship,
+protected offsets, return offset, and selected technique without raw bytes.
+`Plan.expand(stage)` exposes the exact format payload, prompts, codecs, sparse
+overflow layout, and generated chain actions.
+
+`examples/cage.py` is the canonical quick stack solve. It has executed locally
+against the real Cage artifact. The opt-in Docker test uses
+`PWNX_CAGE_CHALLENGE=/path/to/cage-directory` plus `PWNX_RUN_CTF_E2E=1` and
+requires `cage`, its supplied libc/loader, and `solve_pwnx.py`.
+
+### 16.5 Heap Exploitation
 
 The competition-facing heap API maps a conventional indexed menu onto
 allocator recipes. The author declares the vulnerable operations and
@@ -1109,7 +1228,7 @@ inputs require explicit `path_size=` or `scratch_size=` because ownership and
 capacity cannot otherwise be proved. HeapStorage requires a positive size,
 non-negative in-domain slot, and non-empty semantic role.
 
-### 16.5 Constrained Control Flow
+### 16.6 Constrained Control Flow
 
 Some challenges provide a controlled encoded buffer, an indexed indirect call,
 and useful register state rather than a conventional return-address overflow.
@@ -1226,7 +1345,7 @@ Challenge and constraints are exported, while Action/EffectContract/Payload and
 controlled-buffer/ROP implementation types are available only from
 `pwnx.advanced` or backend namespaces.
 
-### 16.6 Stream Effects and FILE Layouts
+### 16.7 Stream Effects and FILE Layouts
 
 FSOP is modeled as a requested stream effect against an explicit libc layout:
 
@@ -1248,7 +1367,7 @@ unrelated capabilities, unsupported layouts, missing storage, and
 wide-vtable-validation assumptions fail during proof construction rather than
 during target I/O.
 
-### 16.7 Bounded Investigation
+### 16.8 Bounded Investigation
 
 Investigation produces candidate evidence, not exploit truth:
 
@@ -1276,7 +1395,7 @@ subprocess JSON contract. Every report retains hypotheses, rejected adapters,
 artifacts, resource metrics, and next validation requirements; no hypothesis is
 silently promoted to a fact.
 
-### 16.8 Platform and Service Effects
+### 16.9 Platform and Service Effects
 
 Platform differences remain adapters over the same target/action contracts:
 
@@ -1299,7 +1418,7 @@ uses bounded commands plus remote size and digest verification. Competition
 submission requires explicit authorization and an idempotency key. Credential
 values never enter recipes or traces; only credential references do.
 
-### 16.9 Raw-Code Experiment
+### 16.10 Raw-Code Experiment
 
 `ShellcodeExperiment` is the purpose-native answer to testing raw shellcode. It
 requires explicit authorization, a matching backend/architecture, and bounds
