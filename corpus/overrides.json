@@ -1,0 +1,16 @@
+{
+  "dice-2026-quals/pwn_message-store": {
+    "pwnx_status": "verified",
+    "native_status": "verified",
+    "native_evidence": "Real Linux Docker execution reached the shell sentinel through the constrained-control frontend.",
+    "priority": "low",
+    "notes": "Canonical pwnx 0.5 controlled-buffer/indexed-call/pivot/execve acceptance challenge."
+  },
+  "greyctf2026/finals/pwn/dist-artifact-11-revenge": {
+    "pwnx_status": "verified",
+    "native_status": "verified",
+    "native_evidence": "Real Linux Docker execution reached the shell sentinel through the custom boundary and declarative protocol flow.",
+    "priority": "low",
+    "notes": "Verified pwnx solve for deterministic decoder inversion and protected stack overwrite."
+  }
+}
