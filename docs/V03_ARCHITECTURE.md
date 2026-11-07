@@ -1,4 +1,4 @@
-# Pwnx 0.3 architecture
+# Pwnx 0.5 architecture over the 0.3 semantic kernel
 
 ## Product model
 
@@ -97,23 +97,24 @@ or tube call. The easy ret2win path remains unchanged.
 `control_flow.py` provides the same mechanics-versus-reasoning boundary for
 hard control-flow challenges that do not resemble a standard overflow.
 
-`sugar.py` is an optional syntax compressor over those objects:
+`sugar.py` and the fluent control-flow builders form the opinionated 0.5
+competition surface:
 
 - `Challenge.menu()` maps command or `(command, prompt, type, ...)` tuple specs
   into the existing typed Menu/Choice/Field model.
-- `ControlledBuffer.written_by()` and `buffer[offset]` configure the existing
-  writer and bounded qword slice.
+- `buffer(..., encoding=...).written_by()` configures the writer;
+  `buffer.qword(offset)` creates the bounded dispatch slice.
 - `QuickOperation.indexes()` delegates to `indirect_call()` with register
-  keyword state; `pivot(eax=buffer, ...)` delegates to the explicit stack and
-  pointer-register form.
-- Callable `Challenge.rop()` maps `pop_REG`, `zero_REG`, `move_DST_SRC`, and
-  `syscall` keywords into the same RopPalette.
+  keyword state; `pivot(register=..., stack=..., gadget=...)` is the only
+  primary pivot form.
+- `Challenge.rop(constraint).pop(...).zero(...).move(...).syscall(...)` is the
+  immutable semantic chain builder.
 
 This veneer adds no action, provider, payload, or replay type. Acceptance tests
 compare its plan dictionary, lowered Actions, EffectContracts, channels, codecs,
-payload bytes, table index, execution, and replay to the explicit API. It deliberately avoids a general operator-overload DSL:
-`buffer[offset]` means only a checked qword slice, and challenge relationships
-remain explicit arguments.
+payload bytes, table index, execution, and replay to the explicit API. It does
+not add a general operator-overload DSL; challenge relationships remain
+explicit method arguments.
 
 When `written_by()` receives a QuickOperation, binding requires exactly one
 bytes field. The bound BytesCodec maximum becomes
@@ -124,25 +125,23 @@ siblings remain immutable. Independent buffer bindings are order-invariant.
 Their only shared authoring state is the Menu's monotonic operation-ID counter,
 which is also shared with explicit invocation.
 
-- `ByteConstraint` validates every fixed gadget/value and the complete payload;
+- The byte-constraint contract validates every fixed gadget/value and complete payload;
   `utf8()` is the shipped encoding constraint.
-- `ControlledBuffer` owns a target address, finite size, writer operation,
+- The controlled buffer owns a target address, finite size, writer operation,
   constraints, and one region map for stored data, generated ROP qwords, the
   dispatch qword, and generated path bytes. Role/range diagnostics reject every
   partial or complete overlap.
-- `indirect_call()` computes the table index from the declared table and target
+- Indexed-call control computes the index from the declared table and target
   slice, validates entry alignment, records the trigger and register state, and
   returns a capability.
-- `pivot()` requires the declared pointer register to equal the controlled
+- Pivot control requires the declared pointer register to equal the controlled
   buffer address and validates the pinned pivot gadget.
-- `RopPalette` maps pinned addresses to semantics (`pop`, `zero`, `move`, and
-  `syscall`). It is owned by the creating Challenge, executable artifact digest,
-  and target architecture. Callers may use explicit maps or strict readable
-  `pinned=` forms. Register aliases normalize to canonical 64-bit names and are
-  then validated against the target ArchitectureSpec. Unknown registers fail
-  in state, pivot, explicit palette, and pinned declarations; extra operands
-  and unknown semantics fail. The frontend validates byte
-  representations but does not discover gadgets or infer semantics.
+- The finalized semantic palette maps fluent `pop`, `zero`, `move`, and
+  `syscall` declarations to pinned addresses. It is owned by the creating
+  Challenge, executable artifact digest, and target architecture. Register
+  aliases normalize to canonical 64-bit names and are then validated against
+  the target ArchitectureSpec. The frontend validates byte representations but
+  does not discover gadgets or infer semantics.
 - The execve goal compiler places the path and dispatch qword, realizes the
   register state, validates the complete constrained payload, and orders the
   buffer write, computed index operation, and trigger.
@@ -154,13 +153,29 @@ register, pivot, palette, and strategy fields without raw payload bytes;
 `Plan.expand(stage)` exposes the exact payload and operations. They are two
 views of the same lowered Actions and contracts.
 
+### Advanced flexibility surface
+
+Explicit construction types and map-based helpers are intentionally outside
+the primary namespace:
+
+~~~python
+from pwnx.advanced import controlled_buffer, pivot, rop_palette
+~~~
+
+This surface exists for generated gadgets, unusual schemas, and integration
+authors. It produces the same IR as the canonical API. Primary `pwnx.__all__`
+does not export Action, EffectContract, Payload, BufferSlice, ControlledBuffer,
+RopBuilder, or RopPalette.
+
 `examples/message_store_sugar.py` is the primary hard-challenge example;
 `examples/message_store_constrained.py` preserves the explicit fallback. The
 solve has executed locally against the real Dice challenge. Unit tests
 also execute the generated UTF-8 payload/index/trigger sequence and prove trace
 replay performs no live effects. An opt-in Docker E2E test, gated by
-`PWNX_RUN_CTF_E2E=1` and artifact presence, sends a shell sentinel through the
-actual challenge and requires it in the output.
+`PWNX_RUN_CTF_E2E=1` plus `PWNX_DICE_CHALLENGE=/path/to/artifact-directory`,
+sends a shell sentinel through the actual challenge and requires it in the
+output. The directory contains the `challenge` binary and canonical
+`solve_pwnx.py`.
 
 Constrained-goal preparation owns protocol operation numbering. Successful
 preparation consumes unique menu IDs; failed preparation restores all

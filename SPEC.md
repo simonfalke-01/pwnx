@@ -1,7 +1,7 @@
 # Pwnx Specification
 
-Status: Version 0.3 semantic kernel and purpose-parity surface implemented  
-Version: 0.3  
+Status: Version 0.5 canonical competition API over the verified semantic kernel  
+Version: 0.5  
 Language: Python 3  
 Last updated: 2026-11-07
 
@@ -9,7 +9,8 @@ Last updated: 2026-11-07
 
 Pwnx is a Python-embedded, declarative exploit compiler.
 
-Version 0.3 makes the semantic kernel the mandatory extension boundary.
+Version 0.5 keeps the semantic kernel as the mandatory extension boundary and
+makes one opinionated, fluent competition surface canonical.
 Target recipes, conversations, evidence, capabilities, technique proofs, and
 experiments are the primary product concepts. Compatibility helpers and
 mechanism-level compilers remain available under explicit namespaces.
@@ -1129,29 +1130,32 @@ message = c.buffer(
 
 dispatch = c.control(store.color.indexes(
     table=0x2F08E8,
-    target=message[80],
+    target=message.qword(80),
     trigger=store.show,
     eax=message,
 ))
-pivot = c.control(dispatch.pivot(eax=message, gadget=0x242D79))
+pivot = c.control(
+    dispatch.pivot(register="eax", stack=message, gadget=0x242D79)
+)
 
-palette = c.rop(
-    pop_rdi=0x243565,
-    pop_rsi=0x243431,
-    zero_rax=0x247431,
-    move_rdx_rax=0x2B184E,
-    pop_rcx=0x247566,
-    move_rax_rcx=0x2B4E73,
-    syscall=0x2A6602,
-    constraint=utf8(),
+palette = (
+    c.rop(utf8())
+    .pop("rdi", 0x243565)
+    .pop("rsi", 0x243431)
+    .zero("rax", 0x247431)
+    .move("rdx", "rax", 0x2B184E)
+    .pop("rcx", 0x247566)
+    .move("rax", "rcx", 0x2B4E73)
+    .syscall(0x2A6602)
 )
 
 c.want(c.execve("sh"), via=pivot, using=palette)
 ~~~
 
 This is pure syntax compression. `c.menu()` creates ordinary protocol objects;
-`buffer[offset]` is a bounded qword slice; operation `.indexes()`, register
-keyword pivot, and callable `c.rop()` delegate to the explicit APIs below. They
+`buffer.qword(offset)` is a bounded qword slice; operation `.indexes()`, the
+explicit register/stack pivot, and fluent `c.rop()` builder delegate to the
+same semantic objects. They
 produce identical plan IR, lowered Actions and contracts, channels, codecs,
 payload, computed index, execution, and replay behavior. Pwnx
 does not introduce arithmetic/operator-overload exploit syntax or infer the
@@ -1169,38 +1173,12 @@ sequence.
 The equivalent explicit fallback remains available for unusual schemas:
 
 ~~~python
-message = c.buffer(
-    "message",
-    at=0x2F9E38,
-    size=0x1000,
-    write=store.message,
-    constraint=utf8(),
-)
-
-dispatch = c.control(c.indirect_call(
-    table=0x2F08E8,
-    index=store.color,
-    target=message.qword(80),
-    trigger=store.show,
-    state={"eax": message.address},
-))
-
-pivot = c.control(dispatch.pivot(
-    stack=message,
-    pointer_register="eax",
-    gadget=0x242D79,
-))
-
-palette = c.rop.palette(
-    pop={"rdi": 0x243565, "rsi": 0x243431, "rcx": 0x247566},
-    zero={"rax": 0x247431},
-    move={("rdx", "rax"): 0x2B184E, ("rax", "rcx"): 0x2B4E73},
-    syscall=0x2A6602,
-    constraints=[utf8()],
-)
-
-c.want(c.execve("sh"), via=pivot, using=palette)
+from pwnx.advanced import controlled_buffer, pivot, rop_palette
 ~~~
+
+These advanced helpers and their implementation types are not re-exported from
+the primary namespace. See `examples/message_store_constrained.py` for the
+complete explicit form; it lowers identically to the canonical 0.5 solve.
 
 The author owns the challenge facts: buffer/table addresses, target qword,
 register relationship, pivot gadget, and semantic gadget palette. Pwnx owns:
@@ -1214,27 +1192,12 @@ register relationship, pivot gadget, and semantic gadget palette. Pwnx owns:
   semantics;
 - emitting buffer write, index operation, and trigger in order.
 
-The palette accepts explicit `pop=`, `zero=`, `move=`, and `syscall=` fields or
-a `pinned=` map whose readable semantic keys are normalized to those fields.
-Accepted forms are exactly `pop REG`, `zero REG`, `xor REG REG` with identical
-operands, `mov|move DST SRC`, and `syscall[; ret]`. Unknown or extra operands
-fail. Register aliases normalize to 64-bit identities (`eax`→`rax`,
-`edx`→`rdx`, `r8d`→`r8`).
-
-Normalization is followed by validation against the target ArchitectureSpec.
-Unknown registers fail in every declaration position: indirect-call state,
-pivot pointer, explicit `pop`/`zero`/`move` maps, and readable `pinned=` forms.
-
-Every palette is owned by one Challenge, executable artifact SHA-256, and
-target architecture. An execve goal rejects a palette from another challenge,
-changed artifact, or different architecture before lowering.
-
-`ControlledBuffer.store()` supports explicit or automatically aligned data
+The controlled buffer supports explicit or automatically aligned data
 placement. One region map reserves stored data, each generated ROP qword, the
 dispatch qword, and the generated path. Overlap errors name both roles and
-exact ranges. `qword()` and `dispatch()` create bounded target slices. The shipped
-constraint is `utf8()`; `ByteConstraint` is the generic encoding-validation
-contract. A `RopPalette` is pinned semantic evidence, not gadget discovery.
+exact ranges. `qword()` creates bounded target slices. The shipped constraint
+is `utf8()`. The fluent builder records `pop`, `zero`, `move`, and `syscall`
+semantics; it does not discover gadgets.
 
 Missing register realizations, invalid encoded addresses, out-of-range slices,
 unaligned table targets, incorrect register state, and impossible string/layout
@@ -1248,8 +1211,8 @@ The primary `examples/message_store_sugar.py` solve and its explicit fallback
 has executed locally against the real Dice challenge. Regression tests also execute its
 generated UTF-8 payload/index/trigger choreography and replay the trace without
 live target effects. The opt-in E2E test runs the actual challenge in Docker
-when `PWNX_RUN_CTF_E2E=1` and the artifact is available, then confirms a shell
-sentinel.
+when `PWNX_RUN_CTF_E2E=1` and `PWNX_DICE_CHALLENGE` points to the directory
+containing `challenge` and `solve_pwnx.py`, then confirms a shell sentinel.
 
 Preparing a constrained goal is transactional with respect to protocol
 operation IDs. Successful preparation consumes unique IDs for its writer,
@@ -1257,6 +1220,11 @@ computed index, and trigger. Any preparation failure restores all discovered
 menu counters. The cache is keyed by ControlledBuffer revision; repeated plan
 construction reuses prepared actions without consuming new IDs, while multiple
 goals retain distinct operations.
+
+The primary `pwnx.__all__` positions the fluent competition API as the default:
+Challenge and constraints are exported, while Action/EffectContract/Payload and
+controlled-buffer/ROP implementation types are available only from
+`pwnx.advanced` or backend namespaces.
 
 ### 16.6 Stream Effects and FILE Layouts
 
@@ -1503,7 +1471,7 @@ Unverified assumptions
 
 ## 21. Non-Goals
 
-Pwnx 0.3 does not promise:
+Pwnx 0.5 does not promise:
 
 - Unbounded or autonomous vulnerability discovery.
 - Arbitrary exploit synthesis.
@@ -1553,7 +1521,7 @@ Pwnx 0.1 should support:
 - Deterministic plan selection.
 - Plan, explain, run, trace, diff, and replay.
 
-Version 0.3 adds through the shared semantic kernel:
+Version 0.5 additionally exposes through the shared semantic kernel:
 
 - Versioned allocator-state and heap capability proofs.
 - Versioned FILE-layout and stream-capability proofs.

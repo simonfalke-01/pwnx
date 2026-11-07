@@ -7,7 +7,7 @@ environment, and records an experiment that can be explained or replayed.
 
 ## The authoring model
 
-Pwnx 0.3 has six primary concepts:
+Pwnx 0.5 presents six primary concepts through an opinionated competition API:
 
 - **Target recipe** — how a reproducible target instance is materialized.
 - **Conversation** — typed protocol messages and ordered state transitions.
@@ -253,21 +253,23 @@ message = x.buffer(
 
 call = x.control(store.color.indexes(
     table=0x2F08E8,
-    target=message[80],
+    target=message.qword(80),
     trigger=store.show,
     eax=message,
 ))
-pivot = x.control(call.pivot(eax=message, gadget=0x242D79))
+pivot = x.control(
+    call.pivot(register="eax", stack=message, gadget=0x242D79)
+)
 
-rop = x.rop(
-    pop_rdi=0x243565,
-    pop_rsi=0x243431,
-    zero_rax=0x247431,
-    move_rdx_rax=0x2B184E,
-    pop_rcx=0x247566,
-    move_rax_rcx=0x2B4E73,
-    syscall=0x2A6602,
-    constraint=utf8(),
+rop = (
+    x.rop(utf8())
+    .pop("rdi", 0x243565)
+    .pop("rsi", 0x243431)
+    .zero("rax", 0x247431)
+    .move("rdx", "rax", 0x2B184E)
+    .pop("rcx", 0x247566)
+    .move("rax", "rcx", 0x2B4E73)
+    .syscall(0x2A6602)
 )
 
 x.want(x.execve("sh"), via=pivot, using=rop)
@@ -275,25 +277,32 @@ x.run()
 ~~~
 
 [`examples/message_store_constrained.py`](examples/message_store_constrained.py)
-keeps the explicit `protocol.menu`, `buffer(write=..., constraint=...)`,
-`indirect_call`, `pivot(pointer_register=...)`, and `rop.palette(...)` form as
-the advanced fallback. Tests prove both forms produce identical plan JSON,
+keeps the explicit construction surface under `pwnx.advanced` as the advanced
+fallback. Tests prove both forms produce identical plan JSON,
 lowered Actions, EffectContracts, channels, codecs, payload bytes, computed
 index, execution, and replay behavior.
+
+~~~python
+from pwnx.advanced import controlled_buffer, pivot, rop_palette
+~~~
+
+That namespace also owns the explicit controlled-buffer, slice, ROP-builder,
+and palette types. They are not primary-package exports.
 
 The sugar is syntax compression, not another IR or an operator-overload DSL:
 
 - `x.menu()` turns `(command, prompt, type, ...)` tuples into the same typed
   Menu/Choice/Field objects. Operations remain ordinary callable objects.
 - `buffer(..., encoding="utf8").written_by(op)` configures the same
-  ControlledBuffer. `buffer[offset]` is only shorthand for its bounded qword
-  slice—not arbitrary memory or expression syntax.
+  controlled-buffer implementation. `buffer.qword(offset)` declares the
+  bounded dispatch slot.
 - `operation.indexes(...)` delegates to `indirect_call`; register keywords are
   the same declared pre-call state.
-- `pivot(eax=message, gadget=...)` is the register-keyword form of
-  `pivot(stack=message, pointer_register="eax", ...)`.
-- Callable `x.rop(pop_rdi=..., zero_rax=..., move_rdx_rax=..., syscall=...)`
-  builds the same target-bound semantic palette. Malformed keywords fail.
+- `pivot(register="eax", stack=message, gadget=...)` is the only primary
+  pivot spelling.
+- `x.rop(utf8()).pop(...).zero(...).move(...).syscall(...)` is the one
+  canonical, immutable semantic ROP builder. Each step returns a new value;
+  the terminal `syscall()` materializes the target-bound palette.
 
 Binding a QuickOperation as a buffer writer requires exactly one bytes field.
 Its inferred bytes codec is capped at the controlled-buffer capacity; an
@@ -304,25 +313,17 @@ bind the same operation in any order and receive independent limits. Bound
 views share only the underlying Menu's monotonic operation-ID counter, so
 natural and explicit calls consume one deterministic sequence.
 
-`ControlledBuffer` tracks one region map for author-stored data, fixed ROP
+The controlled buffer tracks one region map for author-stored data, fixed ROP
 qwords, the dispatch qword, and the generated execve path. Every region has a
-role and exact range; partial or complete overlap fails with both roles and
-ranges in the diagnostic. `indirect_call()` computes and validates the signed table index
-from the declared table and target qword. `pivot()` proves that the named
-register points at the controlled buffer. The semantic ROP palette describes
-what each pinned gadget does (`pop`, `zero`, `move`, `syscall`) without asking
-the solve to build a chain. Authors may use the explicit maps shown above or
-the equivalent `pinned={"pop rdi": ..., "xor rax": ..., "syscall": ...}`
-shorthand.
+role and exact range; overlap fails with both in the diagnostic. The indexed
+operation computes and validates the signed table index. The pivot proves the
+declared register points at the buffer. The fluent ROP builder records gadget
+semantics explicitly without asking the solve to pack a chain.
 
-Palettes belong to their Challenge, executable artifact SHA-256, and target
-architecture; they cannot be reused against another binary. Pinned grammar is
-strict: `pop REG`, `zero REG`, `xor REG REG` with identical operands,
-`mov|move DST SRC`, and `syscall[; ret]`. Extra operands fail. Explicit and
-pinned declarations normalize aliases (`eax`→`rax`, `edx`→`rdx`, `r8d`→`r8`).
-Validation then checks the canonical name against the target ArchitectureSpec.
-Unknown registers fail consistently in indirect-call state, pivot pointers,
-explicit palette maps, and `pinned=` entries.
+The final semantic palette belongs to its Challenge, executable artifact
+SHA-256, and target architecture. Register aliases normalize to canonical
+64-bit names and are then validated against the ArchitectureSpec. Unknown
+registers fail consistently in state, pivot, and fluent ROP declarations.
 
 The execve strategy searches for a path location whose pointer, fixed dispatch
 slot, pivot, register setup, syscall number, and complete payload all satisfy
@@ -337,8 +338,20 @@ execve strategy—without dumping payload bytes. `plan.expand(stage)` exposes th
 exact encoded buffer write, computed index, and trigger. The shipped example
 has executed successfully against the real Dice challenge locally. The opt-in
 `test_real_dice_message_store_solve_gets_shell` runs it in Docker when
-`PWNX_RUN_CTF_E2E=1` and the artifact is present, then verifies a shell
-sentinel; normal tests cover deterministic execution and effect-free replay.
+`PWNX_RUN_CTF_E2E=1` and `PWNX_DICE_CHALLENGE` names the artifact directory,
+then verifies a shell sentinel; normal tests cover deterministic execution and
+effect-free replay. The directory must contain `challenge` and `solve_pwnx.py`:
+
+~~~bash
+PWNX_DICE_CHALLENGE=/path/to/pwn_message-store \
+PWNX_RUN_CTF_E2E=1 \
+pytest -q tests/test_control_flow.py -k real_dice_message_store_solve_gets_shell
+~~~
+
+The primary `pwnx` namespace intentionally exports the concise authoring
+surface, including `Challenge` and `utf8`, but not framework types such as
+Action, EffectContract, Payload, controlled-buffer slices, or ROP builder/
+palette types. Explicit construction lives under `pwnx.advanced`.
 
 Successful goal preparation reserves unique menu operation IDs for its buffer
 write, computed index, and trigger. Failed preparation restores every affected
@@ -433,7 +446,7 @@ trailing, oversized, or excessive-ratio data before it reaches the solve.
 ## Compatibility and backend mechanisms
 
 Pwnx 0.2 mechanisms remain available for existing solves, but they are not the
-primary 0.3 authoring language:
+primary 0.5 authoring language:
 
 ~~~python
 from pwnx.compat import pwntools

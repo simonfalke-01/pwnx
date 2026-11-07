@@ -1,8 +1,36 @@
-# Migrating pwnx 0.2 solves to 0.3
+# Migrating pwnx solves through 0.5
 
 Pwnx 0.3 preserves solve behavior through explicit compatibility and backend
 namespaces. The primary package no longer exposes pwntools-shaped helpers or
 mechanism compilers as attributes; migration makes that boundary explicit.
+
+## Migrating constrained-control solves from 0.4 to 0.5
+
+Version 0.5 makes one autocomplete-friendly surface canonical and moves
+map-based construction plus implementation types to `pwnx.advanced`.
+
+| Removed 0.4 primary spelling | Canonical 0.5 spelling | Explicit flexibility path |
+| --- | --- | --- |
+| `x.buffer(..., writer=op)` or `write=op` | `x.buffer(...).written_by(op)` | `controlled_buffer(x, ..., writer=op)` |
+| `x.buffer(..., constraint=utf8())` or `constraints=[...]` | `x.buffer(..., encoding="utf8")` | `controlled_buffer(..., constraints=[...])` |
+| `message[80]` | `message.qword(80)` | `BufferSlice` is available from `pwnx.advanced` |
+| `call.pivot(eax=message, gadget=...)` | `call.pivot(register="eax", stack=message, gadget=...)` | `pivot(call, stack=message, pointer_register="eax", gadget=...)` |
+| `call.pivot(pointer_register="eax", stack=message, ...)` | `call.pivot(register="eax", stack=message, ...)` | `pwnx.advanced.pivot(...)` |
+| `x.rop(pop_rdi=..., zero_rax=..., move_rdx_rax=..., syscall=...)` | `x.rop(utf8()).pop("rdi", ...).zero("rax", ...).move("rdx", "rax", ...).syscall(...)` | `rop_palette(x, pop=..., zero=..., move=..., syscall=...)` |
+| `x.rop(encoding="utf8")` or `x.rop(constraints=[...])` | `x.rop(utf8())` | `rop_palette(..., constraints=[...])` |
+| `x.rop.palette(...)` | Fluent `x.rop(constraint)` builder | `pwnx.advanced.rop_palette(...)` |
+| `pinned={"pop rdi": ..., ...}` | Fluent `.pop()`, `.zero()`, `.move()`, `.syscall()` calls | `rop_palette(..., pinned=...)` |
+| Primary imports of `ControlledBuffer`, `BufferSlice`, `RopBuilder`, `RopPalette`, `Action`, `EffectContract`, or `Payload` | Use `Challenge`, `utf8`, and the fluent methods | Import implementation types from `pwnx.advanced` only when extending the framework |
+
+The explicit flexibility module is intentionally noisy:
+
+~~~python
+from pwnx.advanced import controlled_buffer, pivot, rop_palette
+~~~
+
+Both paths lower to the same Actions, contracts, channels, codecs, payload,
+computed index, trace, and replay result. The migration changes spelling and
+namespace position, not exploit semantics.
 
 ## Return-address control
 

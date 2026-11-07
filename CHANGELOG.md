@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## 0.5.0
 
 - Added a competition-facing advanced exploit frontend: compact heap menus,
   UAF declarations, safe-link and unsorted-bin leaks, deterministic or pinned
@@ -35,6 +35,8 @@
   string/dispatch placement, packing, operation ordering, and final validation.
 - Added `examples/message_store_constrained.py`, verified locally against the
   real Dice challenge, plus execution/replay and failure-diagnostic tests.
+- Documented the opt-in real Dice shell gate with
+  `PWNX_DICE_CHALLENGE=<artifact-directory>` and `PWNX_RUN_CTF_E2E=1`.
 - Unified constrained-buffer layout across stored data, ROP qwords, dispatch,
   and generated path regions with role/range overlap diagnostics; bound ROP
   palettes to Challenge, executable SHA-256, and architecture; tightened pinned
@@ -48,11 +50,11 @@
 - Made constrained-goal menu-ID preparation transactional and cached by buffer
   revision: successful goals consume unique IDs, failed preparation restores
   counters, and repeated plan construction is idempotent.
-- Added optional natural constrained-control syntax: tuple-defined menus,
-  `buffer(..., encoding=...).written_by(op)`, bounded `buffer[offset]`,
-  `operation.indexes(...)`, register-keyword pivots, and callable semantic ROP
-  keywords. It lowers to identical plan IR, payload bytes, index, and replay as
-  the explicit API; no general operator-overload DSL was introduced.
+- Finalized the opinionated 0.5 constrained-control syntax: tuple-defined menus,
+  `buffer(..., encoding=...).written_by(op)`, `buffer.qword(offset)`, indexed
+  operations, explicit `pivot(register=..., stack=..., gadget=...)`, and the
+  immutable `x.rop(constraint).pop().zero().move().syscall()` builder. It lowers
+  to identical IR, payload, index, and replay without a general operator DSL.
 - Made `examples/message_store_sugar.py` the primary Dice solve while retaining
   `message_store_constrained.py` as the explicit advanced fallback.
 - Bound natural-syntax buffer writers to the controlled-buffer capacity without
@@ -61,6 +63,12 @@
   original menu and siblings unchanged. Views share only the monotonic Menu ID
   counter, and explicit/sugar lowering has direct Action/contract/channel/codec
   equality coverage.
+- Moved map-based palettes, explicit controlled-buffer construction, pivot
+  helpers, and implementation types to `pwnx.advanced`; removed their primary
+  aliases and added migration diagnostics for 0.4 solves.
+
+## 0.3.0
+
 - Added typed sorts, independent lifecycle epochs, capabilities, effect
   contracts, evidence, and technique proofs.
 - Added generic provider and goal-strategy planning with stable ranking.

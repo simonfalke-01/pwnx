@@ -26,7 +26,7 @@ remain under `pwnx.backends`.
 | P09 | Turn a crash into control-offset evidence | Bounded cyclic evidence and crash/core investigations | `packing.py`, `diagnostics.py`, `investigation.py`; related tests | Covered |
 | P10 | Inspect and transform bytes | Evidence renderers plus typed reversible transform pipelines; compatibility aliases are not the primary API | `codecs.py`, `packing.py`; codec/packing tests | Covered |
 | P11 | Compile or inspect target code | Explicit toolchain and effect-oriented shellcode backends with architecture support evidence | `toolchain.py`, `shellcode.py`, `architecture.py`; toolchain/shellcode tests | Covered for declared backends |
-| P12 | Realize a control-flow or machine-state goal | Provider/strategy graph returns ranked proofs; optional natural syntax is pure compression over identical IR, with immutable per-buffer writer views that cap inferred codecs, never widen explicit limits, leave the source menu unchanged, bind order-independently, and share only monotonic menu IDs; the explicit API remains the fallback | `sugar.py`, `control_flow.py`, `providers.py`, `techniques.py`; explicit-vs-sugar action/contract/channel/codec/plan/payload/index/execution/replay, immutable multi-buffer binding, and E2E tests; `examples/message_store_sugar.py`, `message_store_constrained.py` | Covered for declared strategies, target identities, architectures, and constraints |
+| P12 | Realize a control-flow or machine-state goal | Provider/strategy graph returns ranked proofs; the opinionated 0.5 surface combines tuple menus, immutable buffer-writer views, `qword`, indexed-call state, explicit register/stack pivot, and fluent constrained ROP while preserving identical IR/payload/index/replay; explicit construction lives only in `pwnx.advanced` | `sugar.py`, `control_flow.py`, `providers.py`, `techniques.py`, `advanced.py`; canonical-vs-advanced action/contract/channel/codec/plan/payload/index/execution/replay, namespace-positioning, migration, and E2E tests; `examples/message_store_sugar.py`, `message_store_constrained.py` | Covered for declared strategies, target identities, architectures, and constraints |
 | P13 | Use signal-return execution | The SROP backend consumes the versioned Linux AMD64 `TargetABI` rt-sigreturn schema and rejects ABIs without one | `abi.py`, `techniques.py`; ABI/technique tests | Covered for the declared Linux AMD64 schema |
 | P14 | Resolve through the dynamic linker | Goal strategy and ret2dlresolve backend, rather than a separate solve language | `providers.py`, `techniques.py`; technique tests | Covered |
 | P15 | Discover/read/write with a format-string primitive | Explicit capability, bounded discovery action, proof/backend, and replayed evidence | `formats.py`, `challenge.py`; format tests | Covered |
@@ -61,7 +61,7 @@ run.
 
 The 0.2 pass copied several useful pwntools-shaped surfaces too close to the
 primary API: packing aliases, tube verbs, direct ROP/shellcode/toolchain
-compilers, and mutable environment profiles. Version 0.3 keeps their working
+compilers, and mutable environment profiles. Version 0.5 keeps their working
 implementations but changes their architectural role:
 
 - `pwnx.compat.pwntools` is the explicit migration namespace.

